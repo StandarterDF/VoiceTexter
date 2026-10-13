@@ -95,6 +95,7 @@ class VoiceTexterApp(ctk.CTk):
         self._lang: str = "ru"
         self._beam_size: int = 1
         self._initial_prompt: str = ""
+        self._paste_method: str = "Ctrl+V"
         self._vad: bool = True
         self._devices: list[tuple[int, str]] = []
 
@@ -141,10 +142,15 @@ class VoiceTexterApp(ctk.CTk):
         self.f_chip = ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
         self.f_label = ctk.CTkFont(family=FONT_FAMILY, size=12)
 
-        root = ctk.CTkFrame(self, fg_color="transparent")
-        root.pack(fill="both", expand=True, padx=20, pady=14)
+        root = ctk.CTkScrollableFrame(
+            self,
+            fg_color=PALETTE["bg"],
+            scrollbar_button_color=PALETTE["border"],
+            scrollbar_button_hover_color=PALETTE["faint"],
+            corner_radius=0,
+        )
+        root.pack(fill="both", expand=True, padx=10, pady=10)
         root.grid_columnconfigure(0, weight=1)
-        root.grid_rowconfigure(5, weight=1)
 
         # --- Заголовок ---
         head = ctk.CTkFrame(root, fg_color="transparent")
@@ -329,6 +335,11 @@ class VoiceTexterApp(ctk.CTk):
         self.beam_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
+        label("Вставка")
+        self.paste_combo = combo(["Ctrl+V", "Shift+Insert"], self._on_setting_change)
+        self.paste_combo.grid(row=row, column=1, pady=6, sticky="ew")
+        row += 1
+
         label("Микрофон")
         mic_frame = ctk.CTkFrame(parent, fg_color="transparent")
         mic_frame.grid(row=row, column=1, pady=6, sticky="ew")
@@ -493,6 +504,11 @@ class VoiceTexterApp(ctk.CTk):
         self.beam_combo.set(
             self._pick(["1", "3", "5"], str(self.cfg.get("beam_size", 1)))
         )
+        self.paste_combo.set(
+            self._pick(
+                ["Ctrl+V", "Shift+Insert"], self.cfg.get("paste_method", "Ctrl+V")
+            )
+        )
         self.prompt_box.delete("1.0", "end")
         self.prompt_box.insert("1.0", str(self.cfg.get("initial_prompt", "") or ""))
         self.mic_combo.set(self._current_device_label())
@@ -541,6 +557,7 @@ class VoiceTexterApp(ctk.CTk):
         except (ValueError, AttributeError):
             self._beam_size = int(self.cfg.get("beam_size", 1))
         self._initial_prompt = self.prompt_box.get("1.0", "end").strip()
+        self._paste_method = self.paste_combo.get() or "Ctrl+V"
         self._vad = self.vad_var.get() if hasattr(self, "vad_var") else True
         self.cfg.update(
             {
@@ -556,6 +573,7 @@ class VoiceTexterApp(ctk.CTk):
                 "vad_filter": self.vad_var.get(),
                 "beam_size": self._beam_size,
                 "initial_prompt": self._initial_prompt,
+                "paste_method": self._paste_method,
             }
         )
         config.save_config(self.cfg)
@@ -707,6 +725,7 @@ class VoiceTexterApp(ctk.CTk):
                 text,
                 restore_clipboard=self.restore_var.get(),
                 trailing_space=self.space_var.get(),
+                method=self._paste_method,
             )
         except Exception as exc:  # noqa: BLE001
             self._post(("log", f"Ошибка вставки: {exc}"))

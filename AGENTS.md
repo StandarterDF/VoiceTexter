@@ -50,9 +50,14 @@ models/        — local faster-whisper model dirs (gitignored), one folder each
 - **Device/compute resolution**: `auto` → `cuda` iff `transcriber.cuda_available()`
   (loads `nvcuda.dll` / `libcuda.so`), else `cpu`; compute `auto` → `float16` on
   CUDA, `int8` on CPU. Reloading with a new device/compute swaps the model.
-- **Paste** = `paster.paste_text`: copy text via pyperclip, tap Ctrl+V with a pynput
-  `Controller`, optionally restore the previous clipboard (short sleep so the target
-  app can read it). The VoiceTexter window must not steal focus — it doesn't.
+- **Paste** = `paster.paste_text`: copy text via pyperclip, then send the paste
+  hotkey **natively on Windows via `SendInput`** (explicit `VK_CONTROL` + `VK_V`),
+  with ~60 ms gaps between events and a `Shift+Insert` alternative. pynput is only
+  a fallback (if `SendInput` returns 0) and the non-Windows path. The `INPUT`
+  struct union must contain `MOUSEINPUT`/`HARDWAREINPUT` too, otherwise its
+  `sizeof` mismatches Windows and `SendInput` silently returns 0. Optionally
+  restores the previous clipboard (short sleep so the target app can read it).
+  The VoiceTexter window must not steal focus — it doesn't.
 - **Recording gate**: `_busy` blocks a new activation while a transcription runs;
   clips shorter than `MIN_AUDIO_SECONDS` (0.25 s) are dropped silently.
 - **Shutdown**: `_on_close` saves settings, aborts recording, stops listeners,

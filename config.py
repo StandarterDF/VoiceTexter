@@ -26,6 +26,7 @@ DEFAULT_CONFIG: dict = {
     "vad_filter": True,
     "beam_size": 1,
     "initial_prompt": "",
+    "paste_method": "Ctrl+V",
     "preload_on_start": True,
     "samplerate": 16000,
 }
