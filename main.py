@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
+import tkinter as tk
 import traceback
 
 import customtkinter as ctk
@@ -24,12 +26,46 @@ from transcriber import Transcriber, cuda_available
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-COLORS = {
-    "ready": "#3ba55d",
-    "record": "#e5484d",
-    "busy": "#f5a623",
-    "error": "#e5484d",
-    "idle": "#8b8b8b",
+FONT_FAMILY = "Segoe UI"
+
+PALETTE = {
+    "bg": "#0f1115",
+    "panel": "#171a21",
+    "panel_2": "#1e222c",
+    "border": "#272c37",
+    "text": "#e8eaf0",
+    "muted": "#818899",
+    "faint": "#5b6274",
+    "accent": "#7c8cff",
+    "accent_hover": "#93a0ff",
+    "record": "#ff5a6a",
+    "busy": "#f2b64c",
+    "ok": "#5fd08a",
+}
+
+# цвет кольца / заливки орба по состоянию
+ORB = {
+    "ready": (PALETTE["accent"], PALETTE["accent"]),
+    "record": (PALETTE["record"], PALETTE["record"]),
+    "busy": (PALETTE["busy"], PALETTE["busy"]),
+    "error": (PALETTE["record"], PALETTE["record"]),
+    "idle": (PALETTE["border"], PALETTE["panel_2"]),
+}
+
+STATUS_COLOR = {
+    "ready": PALETTE["text"],
+    "record": PALETTE["record"],
+    "busy": PALETTE["busy"],
+    "error": PALETTE["record"],
+    "idle": PALETTE["muted"],
+}
+
+HINTS = {
+    "ready": "Удерживайте бинд — пойдёт запись, отпустите — текст вставится.",
+    "record": "Идёт запись… отпустите бинд, чтобы распознать.",
+    "busy": "Распознаю речь…",
+    "error": "Что-то не так. Проверьте микрофон и модель.",
+    "idle": "Прослушивание приостановлено.",
 }
 
 MIN_AUDIO_SECONDS = 0.25
@@ -39,10 +75,7 @@ class VoiceTexterApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.cfg = config.load_config()
-
-        self.title("VoiceTexter — диктовка в активное поле")
-        self.geometry("640x760")
-        self.minsize(560, 640)
+        self.title("VoiceTexter")
 
         # --- внутреннее состояние (читается и из потоков слушателей) ---
         self._events: queue.Queue = queue.Queue()
@@ -52,6 +85,10 @@ class VoiceTexterApp(ctk.CTk):
         self._listening = True
         self._capturing = False
         self._closing = False
+        self._state = "idle"
+        self._model_detail = ""
+        self._phase = 0.0
+        self._angle = 0.0
         # кэш настроек как «простые» значения (безопасно читать из потоков)
         self._model_name: str = ""
         self._input_device = None
@@ -65,205 +102,344 @@ class VoiceTexterApp(ctk.CTk):
         self.hotkeys = HotkeyManager(self._on_activate, self._on_deactivate)
 
         self._build_ui()
+        self._center_window()
         self._load_settings_into_ui()
         # Биндинг ставим ДО сохранения конфига, иначе в config.json уйдёт null.
         self.hotkeys.set_binding(self.cfg.get("binding"))
         self._sync_cached_settings()
         self.hotkeys.start()
 
+        self._set_status("idle", "Готов к работе", "Модель загружается…")
+        self._log("VoiceTexter запущен.")
         self.after(80, self._drain_events)
+        self.after(40, self._animate)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if self.cfg.get("preload_on_start", True):
-            self.after(300, self._preload_model)
+            self.after(200, self._preload_model)
 
-    # ------------------------------------------------------------------ UI
+    # --------------------------------------------------------------- окно
+
+    def _center_window(self) -> None:
+        width, height = 460, 720
+        self.minsize(420, 640)
+        self.update_idletasks()
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    # ----------------------------------------------------------------- UI
 
     def _build_ui(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.configure(fg_color=PALETTE["bg"])
+        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=16, weight="bold")
+        self.f_status = ctk.CTkFont(family=FONT_FAMILY, size=23, weight="bold")
+        self.f_body = ctk.CTkFont(family=FONT_FAMILY, size=13)
+        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        self.f_section = ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")
+        self.f_chip = ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
+        self.f_label = ctk.CTkFont(family=FONT_FAMILY, size=12)
 
-        # --- Заголовок / статус ---
-        header = ctk.CTkFrame(self, corner_radius=12)
-        header.grid(row=0, column=0, padx=14, pady=(14, 6), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
+        root = ctk.CTkFrame(self, fg_color="transparent")
+        root.pack(fill="both", expand=True, padx=20, pady=18)
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(5, weight=1)
+
+        # --- Заголовок ---
+        head = ctk.CTkFrame(root, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            head, text="VoiceTexter", font=self.f_title, text_color=PALETTE["text"]
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            head, text="push-to-talk", font=self.f_small, text_color=PALETTE["faint"]
+        ).grid(row=0, column=1, sticky="e")
+
+        # --- Карточка статуса ---
+        card = ctk.CTkFrame(root, fg_color=PALETTE["panel"], corner_radius=18)
+        card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        card.grid_columnconfigure(0, weight=1)
+
+        self.orb = tk.Canvas(
+            card,
+            width=168,
+            height=168,
+            bg=PALETTE["panel"],
+            highlightthickness=0,
+        )
+        self.orb.grid(row=0, column=0, pady=(18, 4))
+        self._orb_ring = self.orb.create_oval(
+            26, 26, 142, 142, outline=PALETTE["border"], width=3
+        )
+        self._orb_inner = self.orb.create_oval(
+            55, 55, 113, 113, fill=PALETTE["panel_2"], outline=""
+        )
+        self._orb_arc = self.orb.create_arc(
+            26,
+            26,
+            142,
+            142,
+            start=0,
+            extent=78,
+            style="arc",
+            outline=PALETTE["busy"],
+            width=3,
+            state="hidden",
+        )
 
         self.status_label = ctk.CTkLabel(
-            header,
-            text="●  Готов",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color=COLORS["idle"],
+            card, text="Готов", font=self.f_status, text_color=PALETTE["text"]
         )
-        self.status_label.grid(row=0, column=0, padx=16, pady=(14, 2), sticky="w")
-
+        self.status_label.grid(row=1, column=0, padx=24)
         self.hint_label = ctk.CTkLabel(
-            header, text="", font=ctk.CTkFont(size=12), text_color="#9aa0a6"
+            card,
+            text="",
+            font=self.f_small,
+            text_color=PALETTE["muted"],
+            wraplength=360,
+            justify="center",
         )
-        self.hint_label.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
+        self.hint_label.grid(row=2, column=0, padx=24, pady=(2, 18))
 
-        # --- Параметры ---
-        body = ctk.CTkScrollableFrame(self, corner_radius=12)
-        body.grid(row=1, column=0, padx=14, pady=6, sticky="nsew")
-        body.grid_columnconfigure(1, weight=1)
+        # --- Хоткей ---
+        hk = ctk.CTkFrame(root, fg_color="transparent")
+        hk.grid(row=2, column=0, sticky="ew", pady=(18, 0))
+        hk.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hk,
+            text="ГОРЯЧАЯ КЛАВИША",
+            font=self.f_small,
+            text_color=PALETTE["faint"],
+        ).grid(row=0, column=0, pady=(0, 6))
+        self.bind_label = ctk.CTkButton(
+            hk,
+            text="—",
+            font=self.f_chip,
+            height=46,
+            corner_radius=12,
+            fg_color=PALETTE["panel_2"],
+            hover_color=PALETTE["border"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["text"],
+            command=self._start_capture,
+        )
+        self.bind_label.grid(row=1, column=0, sticky="ew")
+        self.capture_banner = ctk.CTkLabel(
+            hk,
+            text="Нажмите клавишу (можно с модификаторами) или кнопку мыши…",
+            font=self.f_small,
+            text_color=PALETTE["busy"],
+        )
+        self.capture_banner.grid(row=2, column=0, pady=(6, 0))
+        self.capture_banner.grid_remove()
 
+        # --- Основной переключатель ---
+        self.toggle_btn = ctk.CTkButton(
+            root,
+            text="⏸   Прослушивание включено",
+            font=self.f_body,
+            height=44,
+            corner_radius=12,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color="#0d0f14",
+            command=self._toggle_listening,
+        )
+        self.toggle_btn.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+
+        # --- Настройки (сворачиваемые) ---
+        settings_wrap, settings = self._make_section(root, "Настройки")
+        settings_wrap.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        self._build_settings(settings)
+
+        # --- Журнал (сворачиваемый) ---
+        log_wrap, log = self._make_section(root, "Журнал")
+        log_wrap.grid(row=5, column=0, sticky="new", pady=(8, 0))
+        self.log_box = ctk.CTkTextbox(
+            log,
+            height=140,
+            fg_color=PALETTE["panel_2"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["muted"],
+            corner_radius=10,
+            scrollbar_button_color=PALETTE["border"],
+            scrollbar_button_hover_color=PALETTE["faint"],
+            font=self.f_small,
+        )
+        self.log_box.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.log_box.configure(state="disabled")
+
+    def _build_settings(self, parent) -> None:
         row = 0
-
-        def section(title: str) -> None:
-            nonlocal row
-            ctk.CTkLabel(
-                body,
-                text=title,
-                font=ctk.CTkFont(size=13, weight="bold"),
-                text_color="#7aa2f7",
-            ).grid(row=row, column=0, columnspan=2, padx=6, pady=(12, 4), sticky="w")
-            row += 1
 
         def label(text: str) -> None:
             nonlocal row
-            ctk.CTkLabel(body, text=text).grid(
-                row=row, column=0, padx=6, pady=4, sticky="w"
+            ctk.CTkLabel(
+                parent, text=text, font=self.f_label, text_color=PALETTE["muted"]
+            ).grid(row=row, column=0, padx=(4, 10), pady=6, sticky="w")
+
+        def combo(values, command):
+            return ctk.CTkComboBox(
+                parent,
+                values=values,
+                command=command,
+                fg_color=PALETTE["panel_2"],
+                border_color=PALETTE["border"],
+                border_width=1,
+                button_color=PALETTE["panel_2"],
+                button_hover_color=PALETTE["border"],
+                dropdown_fg_color=PALETTE["panel_2"],
+                dropdown_hover_color=PALETTE["border"],
+                text_color=PALETTE["text"],
+                dropdown_text_color=PALETTE["text"],
+                corner_radius=9,
+                height=34,
+                font=self.f_body,
             )
 
-        section("Модель распознавания")
         label("Модель")
-        self.model_combo = ctk.CTkComboBox(
-            body, values=self._model_values(), command=self._on_model_change
-        )
-        self.model_combo.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
+        self.model_combo = combo(self._model_values(), self._on_model_change)
+        self.model_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
         label("Устройство")
-        self.device_combo = ctk.CTkComboBox(
-            body, values=["auto", "cuda", "cpu"], command=self._on_model_change
-        )
-        self.device_combo.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
+        self.device_combo = combo(["auto", "cuda", "cpu"], self._on_model_change)
+        self.device_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
         label("Точность")
-        self.compute_combo = ctk.CTkComboBox(
-            body,
-            values=["auto", "float16", "int8_float16", "int8", "float32"],
-            command=self._on_model_change,
+        self.compute_combo = combo(
+            ["auto", "float16", "int8_float16", "int8", "float32"],
+            self._on_model_change,
         )
-        self.compute_combo.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
+        self.compute_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
         label("Язык")
-        self.lang_combo = ctk.CTkComboBox(
-            body, values=["ru", "en", "auto"], command=self._on_setting_change
-        )
-        self.lang_combo.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
+        self.lang_combo = combo(["ru", "en", "auto"], self._on_setting_change)
+        self.lang_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
-        self.reload_btn = ctk.CTkButton(
-            body, text="Загрузить / перезагрузить модель", command=self._preload_model
-        )
-        self.reload_btn.grid(
-            row=row, column=0, columnspan=2, padx=6, pady=(6, 4), sticky="ew"
-        )
-        row += 1
-
-        section("Микрофон")
-        label("Устройство ввода")
-        dev_frame = ctk.CTkFrame(body, fg_color="transparent")
-        dev_frame.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
-        dev_frame.grid_columnconfigure(0, weight=1)
-        self.mic_combo = ctk.CTkComboBox(
-            dev_frame, values=self._device_values(), command=self._on_setting_change
-        )
+        label("Микрофон")
+        mic_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        mic_frame.grid(row=row, column=1, pady=6, sticky="ew")
+        mic_frame.grid_columnconfigure(0, weight=1)
+        self.mic_combo = combo(self._device_values(), self._on_setting_change)
         self.mic_combo.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(
-            dev_frame, text="⟳", width=34, command=self._refresh_devices
+            mic_frame,
+            text="⟳",
+            width=34,
+            height=34,
+            font=self.f_body,
+            fg_color=PALETTE["panel_2"],
+            hover_color=PALETTE["border"],
+            text_color=PALETTE["muted"],
+            corner_radius=9,
+            command=self._refresh_devices,
         ).grid(row=0, column=1, padx=(6, 0))
         row += 1
 
-        section("Горячая клавиша (push-to-talk)")
-        label("Бинд")
-        bind_frame = ctk.CTkFrame(body, fg_color="transparent")
-        bind_frame.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
-        bind_frame.grid_columnconfigure(0, weight=1)
-        self.bind_label = ctk.CTkLabel(
-            bind_frame,
-            text="—",
-            fg_color="#2b2b2b",
-            corner_radius=6,
-            height=32,
-        )
-        self.bind_label.grid(row=0, column=0, sticky="ew")
-        self.bind_btn = ctk.CTkButton(
-            bind_frame, text="Забиндить", width=90, command=self._start_capture
-        )
-        self.bind_btn.grid(row=0, column=1, padx=(6, 0))
+        ctk.CTkButton(
+            parent,
+            text="Перезагрузить модель",
+            font=self.f_body,
+            height=36,
+            fg_color="transparent",
+            hover_color=PALETTE["panel_2"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["text"],
+            corner_radius=9,
+            command=self._preload_model,
+        ).grid(row=row, column=0, columnspan=2, pady=(10, 4), sticky="ew")
         row += 1
 
-        self.capture_banner = ctk.CTkLabel(
-            body,
-            text="Нажмите клавишу (можно с модификаторами) или кнопку мыши…",
-            text_color="#f5a623",
+        ctk.CTkFrame(parent, height=1, fg_color=PALETTE["border"]).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=10
         )
-        self.capture_banner.grid(
-            row=row, column=0, columnspan=2, padx=6, pady=(0, 4), sticky="w"
-        )
-        self.capture_banner.grid_remove()
         row += 1
 
-        section("Поведение")
+        def check(text: str, var: ctk.BooleanVar) -> None:
+            nonlocal row
+            ctk.CTkCheckBox(
+                parent,
+                text=text,
+                variable=var,
+                command=self._on_setting_change,
+                font=self.f_body,
+                text_color=PALETTE["text"],
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hover"],
+                border_color=PALETTE["border"],
+                checkmark_color="#0d0f14",
+                corner_radius=5,
+            ).grid(row=row, column=0, columnspan=2, padx=4, pady=5, sticky="w")
+            row += 1
+
         self.auto_paste_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            body,
-            text="Вставлять текст автоматически (Ctrl+V)",
-            variable=self.auto_paste_var,
-            command=self._on_setting_change,
-        ).grid(row=row, column=0, columnspan=2, padx=6, pady=3, sticky="w")
-        row += 1
-
+        check("Вставлять текст автоматически (Ctrl+V)", self.auto_paste_var)
         self.restore_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            body,
-            text="Возвращать прежнее содержимое буфера обмена",
-            variable=self.restore_var,
-            command=self._on_setting_change,
-        ).grid(row=row, column=0, columnspan=2, padx=6, pady=3, sticky="w")
-        row += 1
-
+        check("Возвращать прежнее содержимое буфера", self.restore_var)
         self.space_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            body,
-            text="Добавлять пробел в конце",
-            variable=self.space_var,
-            command=self._on_setting_change,
-        ).grid(row=row, column=0, columnspan=2, padx=6, pady=3, sticky="w")
-        row += 1
-
+        check("Добавлять пробел в конце", self.space_var)
         self.vad_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            body,
-            text="Отсекать тишину (VAD)",
-            variable=self.vad_var,
-            command=self._on_setting_change,
-        ).grid(row=row, column=0, columnspan=2, padx=6, pady=3, sticky="w")
+        check("Отсекать тишину (VAD)", self.vad_var)
+
+        ctk.CTkLabel(
+            parent,
+            text="Проверка — кликните и продиктуйте",
+            font=self.f_small,
+            text_color=PALETTE["faint"],
+        ).grid(row=row, column=0, columnspan=2, padx=4, pady=(12, 4), sticky="w")
         row += 1
-
-        section("Тестовое поле (кликните сюда и продиктуйте)")
-        self.test_entry = ctk.CTkTextbox(body, height=64)
-        self.test_entry.grid(
-            row=row, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="ew"
+        self.test_entry = ctk.CTkTextbox(
+            parent,
+            height=56,
+            fg_color=PALETTE["panel_2"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["text"],
+            corner_radius=10,
+            font=self.f_body,
         )
-        row += 1
+        self.test_entry.grid(row=row, column=0, columnspan=2, padx=2, sticky="ew")
 
-        # --- Вкл/выкл прослушивания ---
-        self.toggle_btn = ctk.CTkButton(
-            self,
-            text="⏸  Приостановить прослушивание",
-            height=40,
-            command=self._toggle_listening,
+    def _make_section(self, parent, title: str):
+        """Сворачиваемая секция. Возвращает (обёртку, контент-фрейм)."""
+        wrap = ctk.CTkFrame(parent, fg_color=PALETTE["panel"], corner_radius=14)
+        wrap.grid_columnconfigure(0, weight=1)
+        content = ctk.CTkFrame(wrap, fg_color="transparent")
+        content.grid_columnconfigure(1, weight=1)
+
+        state = {"open": False}
+
+        def toggle() -> None:
+            state["open"] = not state["open"]
+            if state["open"]:
+                content.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+                header.configure(text=f"▾   {title}")
+            else:
+                content.grid_forget()
+                header.configure(text=f"▸   {title}")
+
+        header = ctk.CTkButton(
+            wrap,
+            text=f"▸   {title}",
+            anchor="w",
+            font=self.f_section,
+            height=42,
+            corner_radius=12,
+            fg_color="transparent",
+            hover_color=PALETTE["panel_2"],
+            text_color=PALETTE["text"],
+            command=toggle,
         )
-        self.toggle_btn.grid(row=2, column=0, padx=14, pady=(6, 4), sticky="ew")
-
-        # --- Лог ---
-        self.log_box = ctk.CTkTextbox(self, height=150)
-        self.log_box.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="nsew")
-        self.log_box.configure(state="disabled")
+        header.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
+        return wrap, content
 
     # --------------------------------------------------- инициализация UI
 
@@ -350,6 +526,40 @@ class VoiceTexterApp(ctk.CTk):
     def _on_setting_change(self, *_args) -> None:
         self._sync_cached_settings()
 
+    # --------------------------------------------------- орб / состояние
+
+    def _orb_draw(self, state: str) -> None:
+        ring, inner = ORB.get(state, ORB["idle"])
+        self.orb.itemconfig(self._orb_ring, outline=ring)
+        if state == "busy":
+            self.orb.itemconfig(self._orb_inner, state="hidden")
+            self.orb.itemconfig(self._orb_arc, state="normal", outline=ring)
+        else:
+            self.orb.itemconfig(self._orb_inner, state="normal", fill=inner)
+            self.orb.coords(self._orb_inner, 55, 55, 113, 113)
+            self.orb.itemconfig(self._orb_arc, state="hidden")
+
+    def _animate(self) -> None:
+        if self._closing:
+            return
+        if self._state == "record":
+            self._phase += 0.38
+            r = 26 + 8 * (0.5 + 0.5 * math.sin(self._phase))
+            c = 84
+            self.orb.coords(self._orb_inner, c - r, c - r, c + r, c + r)
+        elif self._state == "busy":
+            self._angle = (self._angle + 14) % 360
+            self.orb.itemconfig(self._orb_arc, start=self._angle)
+        self.after(40, self._animate)
+
+    def _set_status(self, state: str, text: str, sub: str | None = None) -> None:
+        self._state = state
+        self.status_label.configure(
+            text=text, text_color=STATUS_COLOR.get(state, PALETTE["text"])
+        )
+        self.hint_label.configure(text=sub if sub is not None else HINTS.get(state, ""))
+        self._orb_draw(state)
+
     # ------------------------------------------------------------- события
 
     def _post(self, event: tuple) -> None:
@@ -373,16 +583,19 @@ class VoiceTexterApp(ctk.CTk):
             self._log(event[1])
         elif kind == "model_ready":
             self._loading = False
-            info = f"{self.transcriber.device}/{self.transcriber.compute_type}"
-            self._set_status("ready", f"Готов · модель {event[1]} ({info})")
+            info = (
+                f"{self.transcriber.device.upper()} · {self.transcriber.compute_type}"
+            )
+            self._model_detail = f"{event[1]} · {info}"
+            self._set_status("ready", "Готов", self._model_detail)
             self._log(f"Модель загружена: {event[1]} [{info}]")
         elif kind == "model_error":
             self._loading = False
-            self._set_status("error", "Ошибка загрузки модели")
+            self._set_status("error", "Ошибка модели")
             self._log(f"Ошибка загрузки модели: {event[1]}")
         elif kind == "result":
             self._busy = False
-            self._set_status("ready", "Готов")
+            self._set_status("ready", "Готов", self._model_detail)
             text = event[1]
             if text:
                 self._log(f"[{len(text)} симв.] {text}")
@@ -394,6 +607,8 @@ class VoiceTexterApp(ctk.CTk):
             self._busy = False
             self._set_status("error", "Ошибка распознавания")
             self._log(f"Ошибка распознавания: {event[1]}")
+        elif kind == "binding":
+            self._apply_binding(event[1])
 
     # --------------------------------------------- запись (из потока hotkey)
 
@@ -402,7 +617,7 @@ class VoiceTexterApp(ctk.CTk):
         if not self._listening or self._capturing:
             return
         if self._busy:
-            self._post(("status", "busy", "Идёт распознавание — подождите…"))
+            self._post(("status", "busy", "Распознавание…"))
             return
         if not self.transcriber.is_loaded(str(config.MODELS_DIR / self._model_name)):
             self._post(("status", "busy", "Модель ещё не готова…"))
@@ -414,7 +629,7 @@ class VoiceTexterApp(ctk.CTk):
             self._post(("status", "error", "Микрофон недоступен"))
             return
         self._recording = True
-        self._post(("status", "record", "●  Запись…"))
+        self._post(("status", "record", "Запись"))
 
     def _on_deactivate(self) -> None:
         """Вызывается из потока слушателя."""
@@ -426,7 +641,7 @@ class VoiceTexterApp(ctk.CTk):
             self._post(("status", "ready", "Готов"))
             return
         self._busy = True
-        self._post(("status", "busy", "Распознавание…"))
+        self._post(("status", "busy", "Распознаю…"))
         threading.Thread(
             target=self._transcribe_worker,
             args=(audio, self._lang, self._beam_size, self._vad),
@@ -458,7 +673,7 @@ class VoiceTexterApp(ctk.CTk):
     def _on_model_change(self, *_args) -> None:
         self._sync_cached_settings()
         self._busy = False
-        self._set_status("idle", "Модель изменена — загружаю…")
+        self._set_status("busy", "Загрузка модели…")
         if self.cfg.get("preload_on_start", True):
             self._preload_model()
 
@@ -473,7 +688,7 @@ class VoiceTexterApp(ctk.CTk):
         self._loading = True
         device = self.device_combo.get()
         compute = self.compute_combo.get()
-        self._set_status("busy", f"Загрузка модели {model}…")
+        self._set_status("busy", "Загрузка модели…", model)
         self._log(f"Загрузка {model} ({device}/{compute})…")
 
         def work() -> None:
@@ -488,15 +703,11 @@ class VoiceTexterApp(ctk.CTk):
     # --------------------------------------------------------- биндинг
 
     def _set_binding_label(self, binding) -> None:
-        label = binding_label(binding)
-        self.bind_label.configure(text=label, fg_color="#2b2b2b")
-        self.hint_label.configure(
-            text=f"Удерживайте «{label}» — идёт запись; отпустите — текст вставится."
-        )
+        self.bind_label.configure(text=binding_label(binding))
 
     def _start_capture(self) -> None:
         self._capturing = True
-        self.bind_label.configure(text="Нажмите…", fg_color="#3a3a1f")
+        self.bind_label.configure(text="Нажмите…", fg_color=PALETTE["panel_2"])
         self.capture_banner.grid()
         self.hotkeys.begin_capture(self._on_binding_captured)
 
@@ -520,17 +731,22 @@ class VoiceTexterApp(ctk.CTk):
         if not self._listening:
             self._recording = False
             self.recorder.abort()
-            self.toggle_btn.configure(text="▶  Возобновить прослушивание")
-            self._set_status("idle", "Прослушивание приостановлено")
+            self.toggle_btn.configure(
+                text="▶   Прослушивание выключено",
+                fg_color=PALETTE["panel_2"],
+                hover_color=PALETTE["border"],
+                text_color=PALETTE["muted"],
+            )
+            self._set_status("idle", "Пауза")
         else:
-            self.toggle_btn.configure(text="⏸  Приостановить прослушивание")
-            self._set_status("ready", "Готов")
+            self.toggle_btn.configure(
+                text="⏸   Прослушивание включено",
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hover"],
+                text_color="#0d0f14",
+            )
+            self._set_status("ready", "Готов", self._model_detail)
             self._log("Прослушивание включено.")
-
-    def _set_status(self, state: str, text: str) -> None:
-        color = COLORS.get(state, COLORS["idle"])
-        prefix = "●  " if state in ("ready", "record") else ""
-        self.status_label.configure(text=f"{prefix}{text}", text_color=color)
 
     def _log(self, message: str) -> None:
         self.log_box.configure(state="normal")
