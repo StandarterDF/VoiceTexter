@@ -1,0 +1,8 @@
+# Нормализация переводов строк
+* text=auto
+
+# Windows-скрипты — всегда CRLF (иначе cmd не парсит .bat)
+*.bat text eol=crlf
+
+# Unix-скрипты — всегда LF
+*.sh text eol=lf
