@@ -17,6 +17,10 @@ def paste_text(
 
     Вставка уходит в то окно, что в фокусе на момент вызова, — само окно
     VoiceTexter фокус не забирает.
+
+    Между нажатиями специально стоят небольшие паузы: если отправить Ctrl и V
+    подряд без задержки, ряд приложений не успевает «увидеть» модификатор и
+    получает просто символ ``v``.
     """
     if not text:
         return
@@ -36,14 +40,20 @@ def paste_text(
         # Если буфер недоступен — хотя бы не падаем.
         pass
 
-    time.sleep(0.05)
+    # Дать буферу обмена «устояться» и отпустить кнопку-биндинг.
+    time.sleep(0.10)
+
     keyboard = Controller()
-    with keyboard.pressed(Key.ctrl):
-        keyboard.press("v")
-        keyboard.release("v")
+    keyboard.press(Key.ctrl_l)
+    time.sleep(0.05)
+    keyboard.press("v")
+    time.sleep(0.05)
+    keyboard.release("v")
+    time.sleep(0.05)
+    keyboard.release(Key.ctrl_l)
 
     if restore_clipboard and previous is not None:
-        time.sleep(0.25)
+        time.sleep(0.30)
         try:
             pyperclip.copy(previous)
         except Exception:  # noqa: BLE001
