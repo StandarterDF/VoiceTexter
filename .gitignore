@@ -1,0 +1,20 @@
+# Виртуальное окружение
+.venv/
+venv/
+
+# Локальные модели Whisper (большие, не коммитим)
+models/
+
+# Пользовательские настройки
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+
+# Логи и мусор
+*.log
+logs/
+temp/

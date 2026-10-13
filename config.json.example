@@ -1,0 +1,18 @@
+{
+  "model": "whisper-large-v3-turbo",
+  "device": "auto",
+  "compute_type": "auto",
+  "language": "ru",
+  "input_device": null,
+  "binding": {
+    "kind": "keyboard",
+    "keys": ["ctrl", "alt", "space"]
+  },
+  "auto_paste": true,
+  "restore_clipboard": true,
+  "trailing_space": true,
+  "vad_filter": true,
+  "beam_size": 1,
+  "preload_on_start": true,
+  "samplerate": 16000
+}
