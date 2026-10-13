@@ -25,6 +25,7 @@ DEFAULT_CONFIG: dict = {
     "trailing_space": True,
     "vad_filter": True,
     "beam_size": 1,
+    "initial_prompt": "",
     "preload_on_start": True,
     "samplerate": 16000,
 }

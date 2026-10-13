@@ -92,16 +92,19 @@ class Transcriber:
         language: str | None = None,
         beam_size: int = 1,
         vad_filter: bool = True,
+        initial_prompt: str | None = None,
     ) -> str:
         if self._model is None:
             raise RuntimeError("Модель не загружена")
         lang = None if not language or language == "auto" else language
+        prompt = (initial_prompt or "").strip() or None
         with self._lock:
             segments, _info = self._model.transcribe(
                 audio,
                 language=lang,
                 beam_size=max(1, int(beam_size)),
                 vad_filter=bool(vad_filter),
+                initial_prompt=prompt,
                 condition_on_previous_text=False,
             )
             return " ".join(seg.text.strip() for seg in segments).strip()

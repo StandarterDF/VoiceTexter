@@ -94,6 +94,7 @@ class VoiceTexterApp(ctk.CTk):
         self._input_device = None
         self._lang: str = "ru"
         self._beam_size: int = 1
+        self._initial_prompt: str = ""
         self._vad: bool = True
         self._devices: list[tuple[int, str]] = []
 
@@ -323,6 +324,11 @@ class VoiceTexterApp(ctk.CTk):
         self.lang_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
+        label("Поиск (beam)")
+        self.beam_combo = combo(["1", "3", "5"], self._on_setting_change)
+        self.beam_combo.grid(row=row, column=1, pady=6, sticky="ew")
+        row += 1
+
         label("Микрофон")
         mic_frame = ctk.CTkFrame(parent, fg_color="transparent")
         mic_frame.grid(row=row, column=1, pady=6, sticky="ew")
@@ -388,6 +394,26 @@ class VoiceTexterApp(ctk.CTk):
         check("Добавлять пробел в конце", self.space_var)
         self.vad_var = ctk.BooleanVar(value=True)
         check("Отсекать тишину (VAD)", self.vad_var)
+
+        ctk.CTkLabel(
+            parent,
+            text="Начальный промпт (для смешанной ru+en речи)",
+            font=self.f_small,
+            text_color=PALETTE["faint"],
+        ).grid(row=row, column=0, columnspan=2, padx=4, pady=(12, 4), sticky="w")
+        row += 1
+        self.prompt_box = ctk.CTkTextbox(
+            parent,
+            height=54,
+            fg_color=PALETTE["panel_2"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["text"],
+            corner_radius=10,
+            font=self.f_body,
+        )
+        self.prompt_box.grid(row=row, column=0, columnspan=2, padx=2, sticky="ew")
+        row += 1
 
         ctk.CTkLabel(
             parent,
@@ -464,6 +490,11 @@ class VoiceTexterApp(ctk.CTk):
             )
         )
         self.lang_combo.set(self._pick(["ru", "en", "auto"], self.cfg.get("language")))
+        self.beam_combo.set(
+            self._pick(["1", "3", "5"], str(self.cfg.get("beam_size", 1)))
+        )
+        self.prompt_box.delete("1.0", "end")
+        self.prompt_box.insert("1.0", str(self.cfg.get("initial_prompt", "") or ""))
         self.mic_combo.set(self._current_device_label())
         self._set_binding_label(self.cfg.get("binding"))
         self.auto_paste_var.set(bool(self.cfg.get("auto_paste", True)))
@@ -505,7 +536,11 @@ class VoiceTexterApp(ctk.CTk):
         self._model_name = model
         self._input_device = self._selected_device()
         self._lang = self.lang_combo.get()
-        self._beam_size = int(self.cfg.get("beam_size", 1))
+        try:
+            self._beam_size = int(self.beam_combo.get())
+        except (ValueError, AttributeError):
+            self._beam_size = int(self.cfg.get("beam_size", 1))
+        self._initial_prompt = self.prompt_box.get("1.0", "end").strip()
         self._vad = self.vad_var.get() if hasattr(self, "vad_var") else True
         self.cfg.update(
             {
@@ -519,6 +554,8 @@ class VoiceTexterApp(ctk.CTk):
                 "restore_clipboard": self.restore_var.get(),
                 "trailing_space": self.space_var.get(),
                 "vad_filter": self.vad_var.get(),
+                "beam_size": self._beam_size,
+                "initial_prompt": self._initial_prompt,
             }
         )
         config.save_config(self.cfg)
@@ -644,14 +681,20 @@ class VoiceTexterApp(ctk.CTk):
         self._post(("status", "busy", "Распознаю…"))
         threading.Thread(
             target=self._transcribe_worker,
-            args=(audio, self._lang, self._beam_size, self._vad),
+            args=(audio, self._lang, self._beam_size, self._vad, self._initial_prompt),
             daemon=True,
         ).start()
 
-    def _transcribe_worker(self, audio, lang: str, beam_size: int, vad: bool) -> None:
+    def _transcribe_worker(
+        self, audio, lang: str, beam_size: int, vad: bool, initial_prompt: str
+    ) -> None:
         try:
             text = self.transcriber.transcribe(
-                audio, language=lang, beam_size=beam_size, vad_filter=vad
+                audio,
+                language=lang,
+                beam_size=beam_size,
+                vad_filter=vad,
+                initial_prompt=initial_prompt,
             )
             self._post(("result", text))
         except Exception as exc:  # noqa: BLE001
