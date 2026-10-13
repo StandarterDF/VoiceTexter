@@ -121,8 +121,8 @@ class VoiceTexterApp(ctk.CTk):
     # --------------------------------------------------------------- окно
 
     def _center_window(self) -> None:
-        width, height = 460, 720
-        self.minsize(420, 640)
+        width, height = 460, 620
+        self.minsize(420, 520)
         self.update_idletasks()
         x = max(0, (self.winfo_screenwidth() - width) // 2)
         y = max(0, (self.winfo_screenheight() - height) // 3)
@@ -141,7 +141,7 @@ class VoiceTexterApp(ctk.CTk):
         self.f_label = ctk.CTkFont(family=FONT_FAMILY, size=12)
 
         root = ctk.CTkFrame(self, fg_color="transparent")
-        root.pack(fill="both", expand=True, padx=20, pady=18)
+        root.pack(fill="both", expand=True, padx=20, pady=14)
         root.grid_columnconfigure(0, weight=1)
         root.grid_rowconfigure(5, weight=1)
 
@@ -158,28 +158,28 @@ class VoiceTexterApp(ctk.CTk):
 
         # --- Карточка статуса ---
         card = ctk.CTkFrame(root, fg_color=PALETTE["panel"], corner_radius=18)
-        card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        card.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         card.grid_columnconfigure(0, weight=1)
 
         self.orb = tk.Canvas(
             card,
-            width=168,
-            height=168,
+            width=132,
+            height=132,
             bg=PALETTE["panel"],
             highlightthickness=0,
         )
-        self.orb.grid(row=0, column=0, pady=(18, 4))
+        self.orb.grid(row=0, column=0, pady=(12, 2))
         self._orb_ring = self.orb.create_oval(
-            26, 26, 142, 142, outline=PALETTE["border"], width=3
+            20, 20, 112, 112, outline=PALETTE["border"], width=3
         )
         self._orb_inner = self.orb.create_oval(
-            55, 55, 113, 113, fill=PALETTE["panel_2"], outline=""
+            44, 44, 88, 88, fill=PALETTE["panel_2"], outline=""
         )
         self._orb_arc = self.orb.create_arc(
-            26,
-            26,
-            142,
-            142,
+            20,
+            20,
+            112,
+            112,
             start=0,
             extent=78,
             style="arc",
@@ -200,11 +200,11 @@ class VoiceTexterApp(ctk.CTk):
             wraplength=360,
             justify="center",
         )
-        self.hint_label.grid(row=2, column=0, padx=24, pady=(2, 18))
+        self.hint_label.grid(row=2, column=0, padx=24, pady=(2, 12))
 
         # --- Хоткей ---
         hk = ctk.CTkFrame(root, fg_color="transparent")
-        hk.grid(row=2, column=0, sticky="ew", pady=(18, 0))
+        hk.grid(row=2, column=0, sticky="ew", pady=(14, 0))
         hk.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             hk,
@@ -247,16 +247,16 @@ class VoiceTexterApp(ctk.CTk):
             text_color="#0d0f14",
             command=self._toggle_listening,
         )
-        self.toggle_btn.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        self.toggle_btn.grid(row=3, column=0, sticky="ew", pady=(14, 0))
 
         # --- Настройки (сворачиваемые) ---
         settings_wrap, settings = self._make_section(root, "Настройки")
-        settings_wrap.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        settings_wrap.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         self._build_settings(settings)
 
         # --- Журнал (сворачиваемый) ---
         log_wrap, log = self._make_section(root, "Журнал")
-        log_wrap.grid(row=5, column=0, sticky="new", pady=(8, 0))
+        log_wrap.grid(row=5, column=0, sticky="new", pady=(6, 0))
         self.log_box = ctk.CTkTextbox(
             log,
             height=140,
@@ -536,7 +536,7 @@ class VoiceTexterApp(ctk.CTk):
             self.orb.itemconfig(self._orb_arc, state="normal", outline=ring)
         else:
             self.orb.itemconfig(self._orb_inner, state="normal", fill=inner)
-            self.orb.coords(self._orb_inner, 55, 55, 113, 113)
+            self.orb.coords(self._orb_inner, 44, 44, 88, 88)
             self.orb.itemconfig(self._orb_arc, state="hidden")
 
     def _animate(self) -> None:
@@ -544,8 +544,8 @@ class VoiceTexterApp(ctk.CTk):
             return
         if self._state == "record":
             self._phase += 0.38
-            r = 26 + 8 * (0.5 + 0.5 * math.sin(self._phase))
-            c = 84
+            r = 19 + 7 * (0.5 + 0.5 * math.sin(self._phase))
+            c = 66
             self.orb.coords(self._orb_inner, c - r, c - r, c + r, c + r)
         elif self._state == "busy":
             self._angle = (self._angle + 14) % 360
