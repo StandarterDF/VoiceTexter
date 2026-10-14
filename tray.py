@@ -77,9 +77,11 @@ class TrayController:
         on_set: Callable[[str, object], None],
         on_reload: Optional[Callable[[], None]] = None,
         on_failed: Optional[Callable[[], None]] = None,
+        on_download: Optional[Callable[[str], None]] = None,
         devices=DEFAULT_DEVICES,
         computes=DEFAULT_COMPUTES,
         models=(),
+        downloads=(),
         languages=DEFAULT_LANGUAGES,
         state: Optional[dict] = None,
         title: str = APP_NAME,
@@ -93,9 +95,11 @@ class TrayController:
         self._on_set = on_set
         self._on_reload = on_reload
         self._on_failed = on_failed
+        self._on_download = on_download
         self._devices = tuple(devices)
         self._computes = tuple(computes)
         self._models = tuple(models)
+        self._downloads = tuple(downloads)
         self._languages = tuple(languages)
         self._state: dict = {
             "listening": True,
@@ -116,6 +120,12 @@ class TrayController:
     # ------------------------------------------------------------- меню
 
     def _build_menu(self):
+        model_items = list(self._model_group())
+        if self._downloads:
+            model_items.append(Menu.SEPARATOR)
+            model_items.append(
+                MenuItem("Скачать модель", Menu(*self._download_group()))
+            )
         items = [
             MenuItem("Открыть окно", self._wrap(self._on_show), default=True),
             MenuItem(self._listening_text, self._wrap(self._on_toggle_listening)),
@@ -132,8 +142,8 @@ class TrayController:
             ),
             MenuItem(
                 "Модель",
-                Menu(*self._model_group()),
-                enabled=bool(self._models),
+                Menu(*model_items),
+                enabled=bool(self._models or self._downloads),
             ),
             MenuItem(
                 "Язык",
@@ -181,6 +191,25 @@ class TrayController:
             )
             for model in self._models
         ]
+
+    def _download_group(self) -> list:
+        items = []
+        for entry in self._downloads:
+            if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                size, label = entry[0], entry[1]
+            else:
+                size, label = entry, entry
+            items.append(
+                MenuItem(str(label), self._wrap(self._make_download(str(size))))
+            )
+        return items or [MenuItem("все модели скачаны", None, enabled=False)]
+
+    def _make_download(self, size: str):
+        def action() -> None:
+            if self._on_download is not None:
+                self._on_download(size)
+
+        return action
 
     # ---------------------------------------------- обёртки для pystray
 
@@ -280,6 +309,23 @@ class TrayController:
             self._icon.title = title
         except Exception:  # noqa: BLE001
             pass
+
+    def update_models(self, models) -> None:
+        """Обновить список локальных моделей (после загрузки новой)."""
+        self._models = tuple(models)
+        self._rebuild()
+
+    def update_downloads(self, downloads) -> None:
+        """Обновить список доступных для загрузки моделей."""
+        self._downloads = tuple(downloads)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        try:
+            self._icon.menu = self._build_menu()
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh()
 
     def _refresh(self) -> None:
         try:

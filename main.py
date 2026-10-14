@@ -18,6 +18,7 @@ import traceback
 import customtkinter as ctk
 
 import config
+import modelstore
 from hotkeys import HotkeyManager, binding_label
 from paster import paste_text
 from recorder import Recorder, list_input_devices
@@ -84,6 +85,8 @@ class VoiceTexterApp(ctk.CTk):
         self._recording = False
         self._busy = False
         self._loading = False
+        self._downloading = False
+        self._download_cancel = threading.Event()
         self._listening = True
         self._capturing = False
         self._closing = False
@@ -199,9 +202,11 @@ class VoiceTexterApp(ctk.CTk):
                 on_set=lambda name, value: self._post(("tray_set", name, value)),
                 on_reload=lambda: self._post(("tray_reload",)),
                 on_failed=lambda: self._post(("tray_failed",)),
+                on_download=lambda size: self._post(("tray_download", size)),
                 devices=["auto", "cuda", "cpu"],
                 computes=["auto", "float16", "int8_float16", "int8", "float32"],
                 models=self._model_values(),
+                downloads=self._download_entries(),
                 languages=["ru", "en", "auto"],
                 state=self._tray_state(),
                 title=self._tray_title(),
@@ -509,6 +514,33 @@ class VoiceTexterApp(ctk.CTk):
         ).grid(row=row, column=0, columnspan=2, pady=(10, 4), sticky="ew")
         row += 1
 
+        label("Скачать модель")
+        dl_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        dl_frame.grid(row=row, column=1, pady=6, sticky="ew")
+        dl_frame.grid_columnconfigure(0, weight=1)
+        self.download_combo = combo(self._download_labels(), lambda *_: None)
+        self.download_combo.grid(row=0, column=0, sticky="ew")
+        self.download_btn = ctk.CTkButton(
+            dl_frame,
+            text="⬇",
+            width=34,
+            height=34,
+            font=self.f_body,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color="#0d0f14",
+            corner_radius=9,
+            command=self._on_download_button,
+        )
+        self.download_btn.grid(row=0, column=1, padx=(6, 0))
+        row += 1
+
+        self.download_status = ctk.CTkLabel(
+            parent, text="", font=self.f_small, text_color=PALETTE["faint"]
+        )
+        self.download_status.grid(row=row, column=0, columnspan=2, padx=4, sticky="w")
+        row += 1
+
         ctk.CTkFrame(parent, height=1, fg_color=PALETTE["border"]).grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=10
         )
@@ -544,6 +576,42 @@ class VoiceTexterApp(ctk.CTk):
         check("Сворачивать в трей при закрытии окна", self.tray_var)
         self.start_min_var = ctk.BooleanVar(value=False)
         check("Запускать сразу свёрнутым в трей", self.start_min_var)
+
+        ctk.CTkFrame(parent, height=1, fg_color=PALETTE["border"]).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=10
+        )
+        row += 1
+
+        self.proxy_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            parent,
+            text="Прокси для загрузки моделей",
+            variable=self.proxy_var,
+            command=self._on_setting_change,
+            font=self.f_body,
+            text_color=PALETTE["text"],
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            border_color=PALETTE["border"],
+            checkmark_color="#0d0f14",
+            corner_radius=5,
+        ).grid(row=row, column=0, columnspan=2, padx=4, pady=5, sticky="w")
+        row += 1
+
+        self.proxy_entry = ctk.CTkEntry(
+            parent,
+            placeholder_text="http://host:port или socks5://user:pass@host:port",
+            fg_color=PALETTE["panel_2"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["text"],
+            placeholder_text_color=PALETTE["faint"],
+            corner_radius=9,
+            height=34,
+            font=self.f_body,
+        )
+        self.proxy_entry.grid(row=row, column=0, columnspan=2, padx=2, sticky="ew")
+        row += 1
 
         ctk.CTkLabel(
             parent,
@@ -658,6 +726,9 @@ class VoiceTexterApp(ctk.CTk):
         self.vad_var.set(bool(self.cfg.get("vad_filter", True)))
         self.tray_var.set(bool(self.cfg.get("minimize_to_tray", True)))
         self.start_min_var.set(bool(self.cfg.get("start_minimized", False)))
+        self.proxy_var.set(bool(self.cfg.get("proxy_enabled", False)))
+        self.proxy_entry.delete(0, "end")
+        self.proxy_entry.insert(0, str(self.cfg.get("proxy_url", "") or ""))
 
     @staticmethod
     def _pick(values, current):
@@ -717,6 +788,8 @@ class VoiceTexterApp(ctk.CTk):
                 "paste_method": self._paste_method,
                 "minimize_to_tray": self.tray_var.get(),
                 "start_minimized": self.start_min_var.get(),
+                "proxy_enabled": self.proxy_var.get(),
+                "proxy_url": self.proxy_entry.get().strip(),
             }
         )
         config.save_config(self.cfg)
@@ -806,6 +879,47 @@ class VoiceTexterApp(ctk.CTk):
             self._busy = False
             self._set_status("error", "Ошибка распознавания")
             self._log(f"Ошибка распознавания: {event[1]}")
+        elif kind == "download_progress":
+            _kind, size, p = event
+            pct = p.get("percent")
+            if pct is None:
+                text = f"{size}: {p.get('file_done', 0) // 1048576} МБ"
+            else:
+                text = f"{size}: {pct}%  ·  {p.get('file', '')}"
+            self._set_status("busy", "Загрузка модели…", text)
+            try:
+                self.download_status.configure(text=text)
+            except Exception:  # noqa: BLE001
+                pass
+        elif kind == "download_done":
+            self._downloading = False
+            self._download_cancel.clear()
+            try:
+                self.download_status.configure(text="")
+            except Exception:  # noqa: BLE001
+                pass
+            self._set_status("ready", "Готов", self._model_detail)
+            self._after_download(event[1])
+        elif kind == "download_cancelled":
+            self._downloading = False
+            self._download_cancel.clear()
+            self._update_download_controls()
+            try:
+                self.download_status.configure(text="")
+            except Exception:  # noqa: BLE001
+                pass
+            self._set_status("ready", "Готов", self._model_detail)
+            self._log("Загрузка отменена.")
+        elif kind == "download_error":
+            self._downloading = False
+            self._download_cancel.clear()
+            self._update_download_controls()
+            try:
+                self.download_status.configure(text="")
+            except Exception:  # noqa: BLE001
+                pass
+            self._set_status("error", "Ошибка загрузки")
+            self._log(f"Не удалось скачать модель: {event[2]}")
         elif kind == "binding":
             self._apply_binding(event[1])
         elif kind == "tray_show":
@@ -816,6 +930,8 @@ class VoiceTexterApp(ctk.CTk):
             self._apply_tray_setting(event[1], event[2])
         elif kind == "tray_reload":
             self._reload_model()
+        elif kind == "tray_download":
+            self._start_download(event[1])
         elif kind == "tray_quit":
             self._force_quit = True
             self._on_close()
@@ -920,6 +1036,125 @@ class VoiceTexterApp(ctk.CTk):
                 self._post(("model_error", f"{type(exc).__name__}: {exc}"))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # --------------------------------------------------- загрузка моделей
+
+    def _download_entries(self) -> list[tuple[str, str]]:
+        """Пары (size, подпись) для моделей, которых ещё нет локально."""
+        entries = []
+        for size in modelstore.known_sizes():
+            if modelstore.is_installed(size, config.MODELS_DIR):
+                continue
+            entries.append((size, f"{size} — {modelstore.approx_size(size)}"))
+        return entries
+
+    def _download_labels(self) -> list[str]:
+        labels = [label for _size, label in self._download_entries()]
+        return labels or ["все модели скачаны"]
+
+    def _proxy_url(self) -> str:
+        try:
+            return self.proxy_entry.get().strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _on_download_button(self) -> None:
+        if self._downloading:
+            self._download_cancel.set()
+            self._log("Отмена загрузки…")
+            return
+        self._start_download()
+
+    def _start_download(self, size: str | None = None) -> None:
+        """Запустить загрузку модели (``size`` — если пришло из трея)."""
+        if self._downloading:
+            self._log("Загрузка уже идёт — дождитесь окончания.")
+            return
+        if size is None:
+            label = self.download_combo.get()
+            size = label.split("—", 1)[0].strip()
+        if size not in modelstore.KNOWN_MODELS:
+            self._log("Выберите модель для загрузки.")
+            return
+        if modelstore.is_installed(size, config.MODELS_DIR):
+            self._log(f"Модель {size} уже скачана.")
+            return
+
+        proxy = self._proxy_url() if self.proxy_var.get() else ""
+        self._downloading = True
+        self._download_cancel.clear()
+        self._update_download_controls()
+        self._set_status(
+            "busy", "Загрузка модели…", f"{size} · {modelstore.approx_size(size)}"
+        )
+        suffix = f" через прокси {proxy}" if proxy else ""
+        self._log(f"Скачиваю {size} ({modelstore.approx_size(size)}){suffix}…")
+        threading.Thread(
+            target=self._download_worker, args=(size, proxy), daemon=True
+        ).start()
+
+    def _download_worker(self, size: str, proxy: str) -> None:
+        last = {"percent": -1}
+
+        def on_progress(p: dict) -> None:
+            if p.get("percent") != last["percent"]:
+                last["percent"] = p.get("percent")
+                self._post(("download_progress", size, p))
+
+        try:
+            modelstore.download(
+                size,
+                config.MODELS_DIR,
+                proxy_url=proxy,
+                on_progress=on_progress,
+                should_stop=self._download_cancel.is_set,
+            )
+            self._post(("download_done", size))
+        except modelstore.DownloadCancelled:
+            self._post(("download_cancelled", size))
+        except Exception as exc:  # noqa: BLE001
+            self._post(("download_error", size, f"{type(exc).__name__}: {exc}"))
+
+    def _update_download_controls(self) -> None:
+        try:
+            self.download_combo.configure(values=self._download_labels())
+            if self._downloading:
+                self.download_btn.configure(
+                    text="✕",
+                    fg_color=PALETTE["panel_2"],
+                    hover_color=PALETTE["border"],
+                    text_color=PALETTE["text"],
+                )
+            else:
+                self.download_btn.configure(
+                    text="⬇",
+                    fg_color=PALETTE["accent"],
+                    hover_color=PALETTE["accent_hover"],
+                    text_color="#0d0f14",
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_model_options(self, select: str | None = None) -> None:
+        values = self._model_values()
+        try:
+            self.model_combo.configure(values=values)
+            if select:
+                self.model_combo.set(select)
+            elif self.model_combo.get() not in values:
+                self.model_combo.set(self._pick(values, None))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _after_download(self, size: str) -> None:
+        name = modelstore.folder_name(size)
+        self._log(f"Модель {size} скачана в models/{name}.")
+        self._refresh_model_options(select=name)
+        if self._tray is not None:
+            self._tray.update_models(self._model_values())
+            self._tray.update_downloads(self._download_entries())
+        self._update_download_controls()
+        self._reload_model()
 
     # --------------------------------------------------------- биндинг
 

@@ -57,6 +57,8 @@ DEFAULT_CONFIG: dict = {
     "samplerate": 16000,
     "minimize_to_tray": True,  # закрытие окна = свернуть в трей, а не выход
     "start_minimized": False,  # запускать сразу в трее
+    "proxy_enabled": False,  # использовать прокси для загрузки моделей
+    "proxy_url": "",  # http://host:port или socks5://user:pass@host:port
 }
 
 

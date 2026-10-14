@@ -1,0 +1,52 @@
+name: Release
+
+# Сборка переносимого ZIP и публикация GitHub Release.
+# Запускается при push тега вида v1.2.3 (или вручную из вкладки Actions).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Generate icon
+        run: python tools/make_icon.py
+
+      - name: Build (PyInstaller, onedir)
+        env:
+          VOICETEXTER_ONEFILE: "0"
+        run: pyinstaller --noconfirm --clean VoiceTexter.spec
+
+      - name: Prepare config
+        run: Copy-Item config.json.example dist\VoiceTexter\config.json
+
+      - name: Package release zip
+        run: python tools/make_release.py
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/VoiceTexter-*-win64.zip
+          generate_release_notes: true

@@ -14,6 +14,7 @@ Flat single-module project (no packages, no `__init__.py`):
 ```
 main.py        — CustomTkinter GUI + app wiring (recording/transcribing/paste orchestration)
 config.py      — config.json load/save, model discovery in models/, frozen-path helpers
+modelstore.py  — model download from Hugging Face (stdlib urllib) + proxy (http/socks5)
 recorder.py    — sounddevice microphone capture (16 kHz mono float32 numpy)
 transcriber.py — faster-whisper wrapper (lazy load, device/compute resolution)
 hotkeys.py     — global push-to-talk listener (pynput keyboard + mouse) and binding capture
@@ -53,6 +54,18 @@ VoiceTexter.spec, build_exe.bat, requirements-build.txt — PyInstaller build
   (`config.list_models`). `large-v3-turbo` is the default. Models are load-on-demand
   in a background thread (`_preload_model`); the hotkey path refuses to record until
   the model reports loaded (`transcriber.is_loaded`).
+- **Model download (modelstore.py)** = a deliberate stdlib-`urllib` downloader, *not*
+  `huggingface_hub` (its Xet/httpx stack is fragile; the plain files API +
+  `resolve/main/<file>` redirects are enough). `KNOWN_MODELS` maps size →
+  (local folder `whisper-<size>`, HF repo); files are written as `*.part` and
+  `os.replace`d only on success, so a half-downloaded `model.bin` is never mistaken
+  for a complete model. Progress is a dict; `should_stop` cancels. Proxy support:
+  `http(s)://` via `urllib.ProxyHandler`; `socks5(h)://` / `socks4(a)://` via PySocks
+  by temporarily swapping `socket.socket` for `socks.socksocket` (guarded by a lock,
+  restored in `finally`) — PySocks constants are `SOCKS5=2`/`SOCKS4=1`, NOT 4/5.
+  The download runs in a worker thread; progress/done/error are `_post`ed as
+  `download_progress` / `download_done` / `download_cancelled` / `download_error`.
+  On success the app refreshes the model combo + tray and reloads the model.
 - **Device/compute resolution**: `auto` → `cuda` iff `transcriber.cuda_available()`
   (loads `nvcuda.dll` / `libcuda.so`), else `cpu`; compute `auto` → `float16` on
   CUDA, `int8` on CPU. Reloading with a new device/compute swaps the model.
@@ -67,7 +80,7 @@ VoiceTexter.spec, build_exe.bat, requirements-build.txt — PyInstaller build
 - **Tray (tray.py)**: pystray runs its own thread + Win32 message loop. Menu
   actions only `_post` events; they are handled on the main thread in
   `_handle_event`: `tray_show`, `tray_toggle`, `tray_set` (`name`, `value`),
-  `tray_reload`, `tray_quit`. The menu has quick settings (device/compute/
+  `tray_reload`, `tray_download` (`size`), `tray_quit`. The menu has quick settings (device/compute/
   model/language radios, auto-paste/VAD checkmarks) whose checked state mirrors
   `TrayController._state`; the app pushes it via `_update_tray_state()` (called
   from `_sync_cached_settings`, so window edits stay in sync). Changing
@@ -124,6 +137,7 @@ setting change and on close. NOTE: the binding must be set on `HotkeyManager`
 ## Dependencies
 
 `requirements.txt` — `customtkinter`, `faster-whisper`, `sounddevice`, `soundfile`,
-`numpy`, `pynput`, `pyperclip`, `pystray`, `Pillow`. `faster-whisper` pulls
-`ctranslate2`, `tokenizers`, `huggingface-hub`, `onnxruntime`, `av`.
+`numpy`, `pynput`, `pyperclip`, `pystray`, `Pillow`, `PySocks`. `faster-whisper`
+pulls `ctranslate2`, `tokenizers`, `huggingface-hub`, `onnxruntime`, `av`.
+`PySocks` is only needed for SOCKS-proxy model downloads.
 `pyinstaller` (see `requirements-build.txt`) is build-only.
