@@ -40,6 +40,57 @@ def resolve_compute(compute: str, device: str) -> str:
     return "float16" if device == "cuda" else "int8"
 
 
+# ----------------------------------------------------------- окно энкодера
+#
+# Whisper/CT2 штатно всегда дополняет мел-спектрограмму до 30 секунд (3000
+# кадров) и кодирует её целиком — даже если фраза длится 2 секунды. Это ~6 с
+# на CPU и заметная доля времени на GPU, независимо от длины клипа. Поэтому
+# дополняем только до реальной длины клипа (с нижним порогом), а не до 30 с.
+# Работает и на CPU, и на GPU (на GPU замер: 7 коротких фраз 2.24 с -> 0.70 с).
+# 3000 = штатное поведение; меньше = быстрее, но контекст короче.
+
+_MAX_FRAMES = 3000
+_pad_seconds = 10.0
+_pad_installed = False
+
+
+def configure(pad_seconds: float | None = None) -> None:
+    """Запомнить желаемое окно паддинга энкодера (в секундах; 30 = штат)."""
+    global _pad_seconds
+    if pad_seconds is not None:
+        try:
+            _pad_seconds = float(pad_seconds)
+        except (TypeError, ValueError):
+            pass
+
+
+def _current_floor() -> int:
+    seconds = max(1.0, min(_MAX_FRAMES / 100.0, _pad_seconds))
+    return int(seconds * 100)
+
+
+def _install_pad_floor() -> None:
+    """Патч faster_whisper.transcribe.pad_or_trim: не паддить до 30 с."""
+    global _pad_installed
+    if _pad_installed:
+        return
+    try:
+        import faster_whisper.transcribe as fw
+    except Exception:  # noqa: BLE001
+        return
+    original = getattr(fw, "pad_or_trim", None)
+    if original is None:
+        return
+
+    def pad_or_trim(array, length=None, *, axis=-1):
+        if length is None:
+            length = max(int(array.shape[axis]), _current_floor())
+        return original(array, length, axis=axis)
+
+    fw.pad_or_trim = pad_or_trim
+    _pad_installed = True
+
+
 class Transcriber:
     def __init__(self) -> None:
         self._model = None
@@ -48,6 +99,7 @@ class Transcriber:
         self._load_lock = threading.Lock()
         self.device = "cpu"
         self.compute_type = "int8"
+        self.pad_seconds = 10.0  # окно энкодера (30 = штатные 30 с)
 
     @property
     def loaded_key(self) -> tuple | None:
@@ -73,6 +125,10 @@ class Transcriber:
         with self._load_lock:
             if self._model is not None and self._model_key == key:
                 return
+            # Кодируем только реальную длину клипа (см. окно энкодера выше).
+            configure(self.pad_seconds)
+            _install_pad_floor()
+
             from faster_whisper import WhisperModel
 
             model = WhisperModel(

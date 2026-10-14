@@ -36,6 +36,8 @@ hotkeys.py     — global push-to-talk listener (pynput keyboard + mouse) and bi
 paster.py      — clipboard + simulated Ctrl+V paste
 textformat.py  — transcript cleanup before paste (capitalize first letter, final period)
 tray.py        — system-tray icon (pystray); optional, callbacks marshal via the event queue
+instances.py   — detects other running VoiceTexter copies (Windows: process-name scan
+                 for the EXE, named mutex for source runs) — warn only, never blocks
 updater.py     — app self-update from GitHub Releases (stdlib urllib): version check,
                  download + sha256, extract, swap files via a detached .bat and restart
 models/        — local faster-whisper model dirs (gitignored), one folder each with model.bin
@@ -122,6 +124,26 @@ VoiceTexter.spec, build_exe.bat, requirements-build.txt — PyInstaller build
   (`_build_update_section`); events `app_update_checked` / `app_update_progress` /
   `app_update_ready` / `app_update_error` are handled on the main thread. Checking is
   **manual only** (button «⟳ Проверить обновления»), then «⬇ Скачать и установить».
+- **Other-instance check (instances.py)** = warn-only, never blocks (users run several
+  copies on purpose). For a frozen EXE it enumerates processes by image name via
+  `CreateToolhelp32Snapshot` (catches older versions too); for source runs it holds a
+  named mutex (`VoiceTexter.Instance`) so copies see each other. `init()` is called in
+  `VoiceTexterApp.__init__`; `_poll_instances()` (every 4 s, main thread) updates
+  `_other_instances`, logs on change and toggles the amber `instance_warn` banner in the
+  header. Detection must never raise — all failures degrade to `other_count() == 0`.
+- **Encoder window (transcriber.py)** = Whisper/CT2 always pad the mel to 30 s
+  (3000 frames) and encode the whole window, even for a 2 s clip — this fixed cost
+  dominates CPU latency (~6 s, large-v3-turbo) and is a big chunk on GPU too, independent
+  of clip length. So we monkey-patch `faster_whisper.transcribe.pad_or_trim` (installed
+  lazily on `load()`; no faster-whisper import at startup) to pad only to
+  `max(real_frames, floor)` where `floor = pad_seconds * 100`. Applies to **both CPU and
+  GPU**. `pad_seconds` (config key, default 10, `30` = stock; old key `cpu_pad_seconds` is
+  migrated and dropped) is exposed as the «Окно энкодера (с)» combobox;
+  `transcriber.configure(pad_seconds=…)` applies it live without a model reload. Measured
+  with equal/better WER: CPU 7 short phrases 43 s → 11 s (~4×), 5 s clip 6.2 s → 1.7 s;
+  GPU 7 short phrases 2.24 s → 0.70 s (~3×), 22 s clip 0.51 s → 0.37 s. The patch is
+  guarded (no-op if the internal name is missing); floor < ~8 s can regress
+  quality/hallucinate, so keep it ≥ 8.
 - **Device/compute resolution**: `auto` → `cuda` iff `transcriber.cuda_available()`
   (loads `nvcuda.dll` / `libcuda.so`), else `cpu`; compute `auto` → `float16` on
   CUDA, `int8` on CPU. Reloading with a new device/compute swaps the model.
