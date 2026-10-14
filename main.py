@@ -21,6 +21,7 @@ import config
 from hotkeys import HotkeyManager, binding_label
 from paster import paste_text
 from recorder import Recorder, list_input_devices
+from textformat import format_transcript
 from transcriber import Transcriber, cuda_available
 from tray import TrayController, load_image, tray_available
 
@@ -156,8 +157,29 @@ class VoiceTexterApp(ctk.CTk):
             pass
 
     def _tray_title(self) -> str:
-        state = "включено" if self._listening else "пауза"
-        return f"VoiceTexter — прослушивание {state}"
+        device = {"auto": "авто", "cpu": "CPU", "cuda": "GPU"}.get(
+            self.device_combo.get(), self.device_combo.get()
+        )
+        state = "вкл" if self._listening else "пауза"
+        return f"VoiceTexter — {device}, {state}"
+
+    def _tray_state(self) -> dict:
+        """Текущие настройки для галочек в меню трея (только главный поток)."""
+        return {
+            "listening": self._listening,
+            "device": self.device_combo.get(),
+            "compute_type": self.compute_combo.get(),
+            "model": self.model_combo.get(),
+            "language": self._lang,
+            "auto_paste": self.auto_paste_var.get(),
+            "vad": self._vad,
+        }
+
+    def _update_tray_state(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.update_state(**self._tray_state())
+        self._tray.set_title(self._tray_title())
 
     def _setup_tray(self) -> None:
         """Создать значок в трее (если установлены pystray и Pillow)."""
@@ -174,9 +196,15 @@ class VoiceTexterApp(ctk.CTk):
                 on_show=lambda: self._post(("tray_show",)),
                 on_toggle_listening=lambda: self._post(("tray_toggle",)),
                 on_quit=lambda: self._post(("tray_quit",)),
-                listening=self._listening,
-                title=self._tray_title(),
+                on_set=lambda name, value: self._post(("tray_set", name, value)),
+                on_reload=lambda: self._post(("tray_reload",)),
                 on_failed=lambda: self._post(("tray_failed",)),
+                devices=["auto", "cuda", "cpu"],
+                computes=["auto", "float16", "int8_float16", "int8", "float32"],
+                models=self._model_values(),
+                languages=["ru", "en", "auto"],
+                state=self._tray_state(),
+                title=self._tray_title(),
             )
             self._tray.start()
         except Exception as exc:  # noqa: BLE001
@@ -198,6 +226,43 @@ class VoiceTexterApp(ctk.CTk):
             self.focus_force()
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------- быстрые настройки в трее
+
+    def _apply_tray_setting(self, name: str, value) -> None:
+        """Применить быструю настройку из меню трея (главный поток)."""
+        try:
+            if name == "device":
+                self.device_combo.set(str(value))
+            elif name == "compute_type":
+                self.compute_combo.set(str(value))
+            elif name == "model":
+                self.model_combo.set(str(value))
+            elif name == "language":
+                self.lang_combo.set(str(value))
+            elif name == "auto_paste":
+                self.auto_paste_var.set(bool(value))
+            elif name == "vad":
+                self.vad_var.set(bool(value))
+            else:
+                return
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Не удалось применить настройку из трея: {exc}")
+            return
+
+        if name in ("device", "compute_type", "model"):
+            # Смена устройства/модели из трея всегда перезагружает модель,
+            # даже если автозагрузка при старте отключена.
+            self._reload_model()
+        else:
+            self._on_setting_change()
+
+    def _reload_model(self) -> None:
+        """Перезагрузить модель с текущими настройками (устройство/точность)."""
+        self._busy = False
+        self._sync_cached_settings()
+        self._set_status("busy", "Загрузка модели…")
+        self._preload_model()
 
     # ----------------------------------------------------------------- UI
 
@@ -655,6 +720,7 @@ class VoiceTexterApp(ctk.CTk):
             }
         )
         config.save_config(self.cfg)
+        self._update_tray_state()
 
     def _on_setting_change(self, *_args) -> None:
         self._sync_cached_settings()
@@ -729,7 +795,7 @@ class VoiceTexterApp(ctk.CTk):
         elif kind == "result":
             self._busy = False
             self._set_status("ready", "Готов", self._model_detail)
-            text = event[1]
+            text = format_transcript(event[1])
             if text:
                 self._log(f"[{len(text)} симв.] {text}")
                 if self.auto_paste_var.get():
@@ -746,6 +812,10 @@ class VoiceTexterApp(ctk.CTk):
             self.show_window()
         elif kind == "tray_toggle":
             self._toggle_listening()
+        elif kind == "tray_set":
+            self._apply_tray_setting(event[1], event[2])
+        elif kind == "tray_reload":
+            self._reload_model()
         elif kind == "tray_quit":
             self._force_quit = True
             self._on_close()
@@ -898,9 +968,7 @@ class VoiceTexterApp(ctk.CTk):
             )
             self._set_status("ready", "Готов", self._model_detail)
             self._log("Прослушивание включено.")
-        if self._tray is not None:
-            self._tray.set_listening(self._listening)
-            self._tray.set_title(self._tray_title())
+        self._update_tray_state()
 
     def _log(self, message: str) -> None:
         self.log_box.configure(state="normal")
