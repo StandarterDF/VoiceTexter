@@ -108,9 +108,14 @@ VoiceTexter.spec, build_exe.bat, requirements-build.txt — PyInstaller build
   `update_cancelled` / `update_error`. `_check_worker` checks all installed sizes;
   `_update_worker` updates one. UI: **no check button for models anymore** — the
   per-row «Обновить» only appears when `note == "update"`, driven by the silent
-  `_check_updates(silent=True)` at start. The proxy checkbox «через прокси» shares the
-  single `self.proxy_var` between the «Модели» section and «Настройки» (do NOT create a
-  second `BooleanVar` in `_build_settings`).
+  `_check_updates(silent=True)` at start. Proxy is controlled by **two separate
+  checkboxes / `BooleanVar`s**: `self.models_proxy_var` («Скачивать модели через прокси»,
+  in the «Модели» section) and `self.app_proxy_var` («Скачивать обновление программы
+  через прокси», in the «Обновление программы» section). Both read the same URL from
+  `self.proxy_entry` (config `proxy_url`); config keys are `proxy_models` / `proxy_app`
+  (legacy single `proxy_enabled` is migrated to both in `config.load_config`).
+  `_models_proxy()` / `_app_proxy()` return `""` when the corresponding box is off — do
+  NOT add a third enable checkbox in `_build_settings` (it now only holds the URL).
 - **App self-update (updater.py)** = GitHub Releases of `StandarterDF/VoiceTexter`.
   `app_version()` parses `packaging/version_info.txt` via `config.resource_path` (the file
   is bundled in the spec as data). `fetch_latest()` reads `/releases/latest`, `is_newer()`
@@ -229,5 +234,5 @@ setting change and on close. NOTE: the binding must be set on `HotkeyManager`
 `requirements.txt` — `customtkinter`, `faster-whisper`, `sounddevice`, `soundfile`,
 `numpy`, `pynput`, `pyperclip`, `pystray`, `Pillow`, `PySocks`. `faster-whisper`
 pulls `ctranslate2`, `tokenizers`, `huggingface-hub`, `onnxruntime`, `av`.
-`PySocks` is only needed for SOCKS-proxy model downloads.
+`PySocks` is only needed for SOCKS-proxy downloads (models and program updates).
 `pyinstaller` (see `requirements-build.txt`) is build-only.

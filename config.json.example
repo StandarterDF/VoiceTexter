@@ -18,6 +18,7 @@
   "samplerate": 16000,
   "minimize_to_tray": true,
   "start_minimized": false,
-  "proxy_enabled": false,
+  "proxy_models": false,
+  "proxy_app": false,
   "proxy_url": ""
 }

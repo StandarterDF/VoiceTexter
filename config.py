@@ -57,7 +57,8 @@ DEFAULT_CONFIG: dict = {
     "samplerate": 16000,
     "minimize_to_tray": True,  # закрытие окна = свернуть в трей, а не выход
     "start_minimized": False,  # запускать сразу в трее
-    "proxy_enabled": False,  # использовать прокси для загрузки моделей
+    "proxy_models": False,  # прокси для загрузки/обновления моделей
+    "proxy_app": False,  # прокси для скачивания обновлений программы
     "proxy_url": "",  # http://host:port или socks5://user:pass@host:port
 }
 
@@ -97,6 +98,13 @@ def load_config() -> dict:
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                # Миграция: раньше была одна галочка proxy_enabled на всё.
+                # Теперь прокси для моделей и для программы включается отдельно.
+                if "proxy_enabled" in data:
+                    legacy = bool(data.get("proxy_enabled"))
+                    data.setdefault("proxy_models", legacy)
+                    data.setdefault("proxy_app", legacy)
+                    data.pop("proxy_enabled", None)
                 cfg.update(data)
         except (OSError, json.JSONDecodeError):
             pass

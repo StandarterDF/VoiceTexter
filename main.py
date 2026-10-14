@@ -344,7 +344,8 @@ class VoiceTexterApp(ctk.CTk):
         self.f_label = ctk.CTkFont(family=FONT_FAMILY, size=12)
 
         # Общая галочка «через прокси» — показывается и в «Моделях», и в «Настройках».
-        self.proxy_var = ctk.BooleanVar(value=False)
+        self.models_proxy_var = ctk.BooleanVar(value=False)
+        self.app_proxy_var = ctk.BooleanVar(value=False)
 
         root = ctk.CTkScrollableFrame(
             self,
@@ -678,19 +679,12 @@ class VoiceTexterApp(ctk.CTk):
         )
         row += 1
 
-        ctk.CTkCheckBox(
+        ctk.CTkLabel(
             parent,
-            text="Прокси для загрузки моделей и обновлений",
-            variable=self.proxy_var,
-            command=self._on_setting_change,
-            font=self.f_body,
-            text_color=PALETTE["text"],
-            fg_color=PALETTE["accent"],
-            hover_color=PALETTE["accent_hover"],
-            border_color=PALETTE["border"],
-            checkmark_color="#0d0f14",
-            corner_radius=5,
-        ).grid(row=row, column=0, columnspan=2, padx=4, pady=5, sticky="w")
+            text="Прокси (URL) — включается галочками в разделах «Модели» и «Обновление программы»",
+            font=self.f_small,
+            text_color=PALETTE["faint"],
+        ).grid(row=row, column=0, columnspan=2, padx=4, pady=(10, 4), sticky="w")
         row += 1
 
         self.proxy_entry = ctk.CTkEntry(
@@ -820,6 +814,20 @@ class VoiceTexterApp(ctk.CTk):
         )
         self.app_install_btn.grid_remove()
 
+        ctk.CTkCheckBox(
+            parent,
+            text="Скачивать обновление программы через прокси",
+            variable=self.app_proxy_var,
+            command=self._on_setting_change,
+            font=self.f_small,
+            text_color=PALETTE["text"],
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            border_color=PALETTE["border"],
+            checkmark_color="#0d0f14",
+            corner_radius=5,
+        ).grid(row=5, column=0, columnspan=2, padx=4, pady=(10, 0), sticky="w")
+
     def _check_app_update(self) -> None:
         if self._app_updating:
             return
@@ -830,7 +838,7 @@ class VoiceTexterApp(ctk.CTk):
         self.app_update_status.configure(
             text="Проверяю обновления на GitHub…", text_color=PALETTE["busy"]
         )
-        proxy = self._download_proxy()
+        proxy = self._app_proxy()
         threading.Thread(
             target=self._app_check_worker, args=(proxy,), daemon=True
         ).start()
@@ -861,7 +869,7 @@ class VoiceTexterApp(ctk.CTk):
         )
         self.app_update_bar.set(0)
         self.app_update_bar.grid()
-        proxy = self._download_proxy()
+        proxy = self._app_proxy()
         threading.Thread(
             target=self._app_install_worker, args=(info, proxy), daemon=True
         ).start()
@@ -991,7 +999,7 @@ class VoiceTexterApp(ctk.CTk):
         ctk.CTkCheckBox(
             parent,
             text="Скачивать модели через прокси",
-            variable=self.proxy_var,
+            variable=self.models_proxy_var,
             command=self._on_setting_change,
             font=self.f_small,
             text_color=PALETTE["text"],
@@ -1310,7 +1318,8 @@ class VoiceTexterApp(ctk.CTk):
         self.vad_var.set(bool(self.cfg.get("vad_filter", True)))
         self.tray_var.set(bool(self.cfg.get("minimize_to_tray", True)))
         self.start_min_var.set(bool(self.cfg.get("start_minimized", False)))
-        self.proxy_var.set(bool(self.cfg.get("proxy_enabled", False)))
+        self.models_proxy_var.set(bool(self.cfg.get("proxy_models", False)))
+        self.app_proxy_var.set(bool(self.cfg.get("proxy_app", False)))
         self.proxy_entry.delete(0, "end")
         self.proxy_entry.insert(0, str(self.cfg.get("proxy_url", "") or ""))
 
@@ -1382,7 +1391,8 @@ class VoiceTexterApp(ctk.CTk):
                 "paste_method": self._paste_method,
                 "minimize_to_tray": self.tray_var.get(),
                 "start_minimized": self.start_min_var.get(),
-                "proxy_enabled": self.proxy_var.get(),
+                "proxy_models": self.models_proxy_var.get(),
+                "proxy_app": self.app_proxy_var.get(),
                 "proxy_url": self.proxy_entry.get().strip(),
             }
         )
@@ -1719,9 +1729,15 @@ class VoiceTexterApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             return ""
 
-    def _download_proxy(self) -> str:
-        """Прокси для загрузки/обновления — если включена галочка «через прокси»."""
-        if not self.proxy_var.get():
+    def _models_proxy(self) -> str:
+        """Прокси для загрузки/обновления моделей (галочка в разделе «Модели»)."""
+        if not self.models_proxy_var.get():
+            return ""
+        return self._proxy_url()
+
+    def _app_proxy(self) -> str:
+        """Прокси для скачивания обновлений программы (галочка в «Обновлении программы»)."""
+        if not self.app_proxy_var.get():
             return ""
         return self._proxy_url()
 
@@ -1737,7 +1753,7 @@ class VoiceTexterApp(ctk.CTk):
             self._log(f"Модель {size} уже скачана.")
             return
 
-        proxy = self._download_proxy()
+        proxy = self._models_proxy()
         self._downloading = True
         self._dl_kind = "download"
         self._active_folder = modelstore.folder_name(size)
@@ -1758,7 +1774,7 @@ class VoiceTexterApp(ctk.CTk):
         if self._downloading:
             self._log("Другая операция уже идёт — дождитесь окончания.")
             return
-        proxy = self._download_proxy()
+        proxy = self._models_proxy()
         self._downloading = True
         self._dl_kind = "update"
         self._active_folder = folder
@@ -1791,7 +1807,7 @@ class VoiceTexterApp(ctk.CTk):
             if not silent:
                 self._log("Нет скачанных моделей — сначала скачайте модель.")
             return
-        proxy = self._download_proxy()
+        proxy = self._models_proxy()
         self._downloading = True
         self._dl_kind = "check"
         self._active_folder = None
@@ -1934,7 +1950,9 @@ class VoiceTexterApp(ctk.CTk):
         proxy_row = ctk.CTkFrame(card, fg_color="transparent")
         proxy_row.grid(row=8, column=0, sticky="ew", padx=16, pady=(14, 0))
         proxy_row.grid_columnconfigure(0, weight=1)
-        proxy_var = ctk.BooleanVar(value=bool(self.proxy_var.get()))
+        proxy_var = ctk.BooleanVar(
+            value=bool(self.models_proxy_var.get() or self.app_proxy_var.get())
+        )
         ctk.CTkCheckBox(
             proxy_row,
             text="Скачивать через прокси",
@@ -2009,7 +2027,9 @@ class VoiceTexterApp(ctk.CTk):
 
         self.lang_combo.set(lang)
         self._set_device_mode(device)
-        self.proxy_var.set(bool(s["proxy_var"].get()))
+        proxy_on = bool(s["proxy_var"].get())
+        self.models_proxy_var.set(proxy_on)
+        self.app_proxy_var.set(proxy_on)
         self.proxy_entry.delete(0, "end")
         self.proxy_entry.insert(0, s["proxy_entry"].get().strip())
         self._sync_cached_settings()
