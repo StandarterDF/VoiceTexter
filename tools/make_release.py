@@ -73,6 +73,14 @@ def build_zip(app_dir: Path, out: Path) -> tuple[int, float]:
 
 
 def main() -> int:
+    # На Windows (CI/консоль) stdout может быть в cp1252 — кириллица в print
+    # тогда роняет скрипт. Принудительно переключаем на UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     parser = argparse.ArgumentParser(description="ZIP для GitHub Release")
     parser.add_argument("--app-dir", default=str(DEFAULT_APP_DIR))
     parser.add_argument("--out", default=None)

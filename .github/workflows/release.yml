@@ -43,6 +43,8 @@ jobs:
         run: Copy-Item config.json.example dist\VoiceTexter\config.json
 
       - name: Package release zip
+        env:
+          PYTHONUTF8: "1"
         run: python tools/make_release.py
 
       - name: Publish to GitHub Release
