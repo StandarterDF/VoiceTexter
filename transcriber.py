@@ -48,9 +48,15 @@ def resolve_compute(compute: str, device: str) -> str:
 # дополняем только до реальной длины клипа (с нижним порогом), а не до 30 с.
 # Работает и на CPU, и на GPU (на GPU замер: 7 коротких фраз 2.24 с -> 0.70 с).
 # 3000 = штатное поведение; меньше = быстрее, но контекст короче.
+#
+# ВАЖНО: слишком маленькое окно (<= 12 с) заставляет Whisper «зацикливаться» и
+# повторять фразу целиком (модель обучалась только на 30-секундных окнах) —
+# это и портит текст, и делает распознавание ДОЛЬШЕ (лишние токены). Значение
+# 20 с на реальной русской речи даёт чистый текст при ускорении ~1.7x; поэтому
+# по умолчанию берём 20, а не 8-10.
 
 _MAX_FRAMES = 3000
-_pad_seconds = 10.0
+_pad_seconds = 20.0
 _pad_installed = False
 
 
@@ -99,7 +105,7 @@ class Transcriber:
         self._load_lock = threading.Lock()
         self.device = "cpu"
         self.compute_type = "int8"
-        self.pad_seconds = 10.0  # окно энкодера (30 = штатные 30 с)
+        self.pad_seconds = 20.0  # окно энкодера (30 = штатные 30 с)
 
     @property
     def loaded_key(self) -> tuple | None:
@@ -162,5 +168,8 @@ class Transcriber:
                 vad_filter=bool(vad_filter),
                 initial_prompt=prompt,
                 condition_on_previous_text=False,
+                # Страховка от «зацикливания» Whisper (повтора n-грамм) —
+                # особенно заметно при уменьшенном окне энкодера.
+                no_repeat_ngram_size=3,
             )
             return " ".join(seg.text.strip() for seg in segments).strip()

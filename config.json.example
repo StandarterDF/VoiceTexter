@@ -13,7 +13,7 @@
   "trailing_space": true,
   "vad_filter": true,
   "beam_size": 1,
-  "pad_seconds": 10,
+  "pad_seconds": 20,
   "preload_on_start": true,
   "samplerate": 16000,
   "minimize_to_tray": true,

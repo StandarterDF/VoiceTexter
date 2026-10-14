@@ -40,15 +40,22 @@ jobs:
         run: pyinstaller --noconfirm --clean VoiceTexter.spec
 
       - name: Prepare config
-        run: Copy-Item config.json.example dist\VoiceTexter\config.json
+        run: |
+          Copy-Item config.json.example dist\VoiceTexter\config.json
+          Copy-Item CHANGELOG.md dist\VoiceTexter\CHANGELOG.md
 
       - name: Package release zip
         env:
           PYTHONUTF8: "1"
         run: python tools/make_release.py
 
+      - name: Generate release notes
+        env:
+          PYTHONUTF8: "1"
+        run: python tools/release_notes.py --version ${{ github.ref_name }}
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/VoiceTexter-*-win64.zip
-          generate_release_notes: true
+          body_path: dist/RELEASE_NOTES.md

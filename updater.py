@@ -165,31 +165,42 @@ def extract_release(zip_path: Path, work_dir: Path) -> Path:
     return inner if inner.is_dir() else stage
 
 
-def write_updater(work_dir: Path, src_dir: Path, app_dir: Path, pid: int) -> Path:
-    """Создать ``apply_update.bat``: ждём выход PID, зеркалим файлы, стартуем."""
+def write_updater(
+    work_dir: Path, src_dir: Path, app_dir: Path, pid: int, wait_seconds: int = 60
+) -> Path:
+    """Создать ``apply_update.bat``: ждём выход PID, зеркалим файлы, стартуем.
+
+    Ожидание ограничено ``wait_seconds`` — если процесс почему-то не завершится,
+    апдейтер всё равно продолжит, чтобы не висеть вечным окном.
+    """
     work_dir = Path(work_dir)
     src_dir = Path(src_dir)
     app_dir = Path(app_dir)
     bat = work_dir / "apply_update.bat"
     log = app_dir / "update_apply.log"
+    tries = max(1, int(wait_seconds))
     content = (
         "@echo off\r\n"
+        "setlocal EnableExtensions EnableDelayedExpansion\r\n"
         "chcp 65001 >nul\r\n"
         f'set "SRC={src_dir}"\r\n'
         f'set "DST={app_dir}"\r\n'
         f'set "LOG={log}"\r\n'
+        "set /a TRIES=0\r\n"
         ":wait\r\n"
-        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
-        "if not errorlevel 1 (\r\n"
-        "    ping -n 2 127.0.0.1 >nul\r\n"
-        "    goto wait\r\n"
-        ")\r\n"
+        f'tasklist /NH /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+        "if errorlevel 1 goto proceed\r\n"
+        "set /a TRIES+=1\r\n"
+        f"if !TRIES! GEQ {tries} goto proceed\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        "goto wait\r\n"
+        ":proceed\r\n"
         'robocopy "%SRC%\\_internal" "%DST%\\_internal" /MIR /NFL /NDL /NJH /NJS '
         '/NP >>"%LOG%" 2>&1\r\n'
         f'copy /y "%SRC%\\{EXE_NAME}" "%DST%\\{EXE_NAME}" >>"%LOG%" 2>&1\r\n'
         f'start "" "%DST%\\{EXE_NAME}"\r\n'
-        'rmdir /s /q "%~dp0staging"\r\n'
-        'del /q "%~dp0*.zip" "%~dp0*.part"\r\n'
+        'rmdir /s /q "%~dp0staging" >nul 2>&1\r\n'
+        'del /q "%~dp0*.zip" "%~dp0*.part" >nul 2>&1\r\n'
         "exit /b\r\n"
     )
     bat.write_text(content, encoding="utf-8")
@@ -197,10 +208,12 @@ def write_updater(work_dir: Path, src_dir: Path, app_dir: Path, pid: int) -> Pat
 
 
 def launch_updater(bat_path: Path) -> None:
-    """Запустить апдейтер отдельным процессом, не привязывая к приложению."""
+    """Запустить апдейтер отдельным скрытым процессом (без окна консоли)."""
     flags = 0
     if os.name == "nt":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # Важно: CREATE_NO_WINDOW (а НЕ DETACHED_PROCESS) — иначе cmd.exe
+        # выделяет себе видимую консоль с бегущим «find ...».
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     subprocess.Popen(
         ["cmd", "/c", str(bat_path)],
         cwd=str(Path(bat_path).parent),

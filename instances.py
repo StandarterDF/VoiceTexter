@@ -1,13 +1,17 @@
 """Обнаружение других запущенных копий VoiceTexter.
 
 Несколько копий одновременно перехватывают один и тот же хоткей, читают
-микрофон, вставляют текст в буфер обмена и пишут один ``config.json`` —
-поэтому при старте приложение предупреждает, если рядом уже работает
-ещё одна копия (в т.ч. другой версии).
+микрофон, вставляют текст в буфер обмена, пишут один ``config.json`` и, главное,
+держат в памяти по полной копии модели — поэтому вторая копия теперь **не
+запускается**: при старте приложение проверяет, не работает ли уже другая копия,
+и, если да, показывает сообщение и выходит.
 
 Для собранного EXE копии ищутся по имени образа процесса (ловятся и старые
-версии). При запуске из исходников используется именованный мьютекс Windows:
-все новые копии-исходники видят его и сообщают о себе.
+версии, которые ещё не умели блокировать запуск). Дополнительно всегда
+создаётся именованный мьютекс Windows — его видят и копии из исходников.
+
+Отключить блокировку (например, для отладки) можно переменной окружения
+``VOICETEXTER_ALLOW_MULTI=1``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,17 @@ INVALID_HANDLE_VALUE = -1
 
 _handle = None  # держим handle мьютекса, пока жив процесс
 _already_running = False
+_initialized = False
+
+
+def _allow_multi() -> bool:
+    """Разрешить несколько копий (для отладки/тестов)."""
+    return os.environ.get("VOICETEXTER_ALLOW_MULTI", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _create_mutex() -> tuple[object, bool]:
@@ -36,11 +51,16 @@ def _create_mutex() -> tuple[object, bool]:
 
 
 def init() -> bool:
-    """Инициализировать определение копий. True, если другая уже запущена."""
-    global _handle, _already_running
-    if getattr(sys, "frozen", False):
-        return False  # для EXE достаточно перечисления процессов
+    """Создать мьютекс (один раз). True, если другая копия уже держит его.
+
+    Идемпотентна: повторный вызов в том же процессе не считает собственную
+    копию «чужой» (иначе мьютекс тут же «занят» нами же).
+    """
+    global _handle, _already_running, _initialized
+    if _initialized:
+        return _already_running
     _handle, _already_running = _create_mutex()
+    _initialized = True
     return _already_running
 
 
@@ -88,11 +108,56 @@ def _other_pids_by_name(name: str) -> list[int]:
     return pids
 
 
-def other_count() -> int:
+def others() -> int:
     """Сколько ещё копий VoiceTexter сейчас запущено (без текущей)."""
     try:
+        count = 1 if _already_running else 0
         if getattr(sys, "frozen", False):
-            return len(_other_pids_by_name(os.path.basename(sys.executable)))
-        return 1 if _already_running else 0
+            count = max(
+                count, len(_other_pids_by_name(os.path.basename(sys.executable)))
+            )
+        return count
     except Exception:  # noqa: BLE001 - определение копий не должно ронять app
         return 0
+
+
+def other_count() -> int:
+    """Совместимый алиас для периодической проверки в UI."""
+    return others()
+
+
+def _notify(text: str) -> None:
+    """Показать нативное окно Windows (без Tk), не роняя приложение."""
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            text,
+            "VoiceTexter",
+            0x00000040,  # MB_ICONINFORMATION | MB_OK
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def block_if_running() -> bool:
+    """Если уже работает другая копия — сообщить и вернуть True (нужно выйти)."""
+    if _allow_multi():
+        return False
+    try:
+        init()
+        count = others()
+    except Exception:  # noqa: BLE001
+        return False
+    if not count:
+        return False
+    _notify(
+        "VoiceTexter уже запущен.\n\n"
+        "Вторая копия не будет запущена: копии делят микрофон, горячую клавишу, "
+        "буфер обмена и config.json, а также держат в памяти по полной копии "
+        "модели (лишняя нагрузка на процессор и оперативную память).\n\n"
+        "Закройте уже работающее окно (или завершите процесс VoiceTexter.exe) "
+        "и запустите снова."
+    )
+    return True

@@ -68,6 +68,7 @@ if exist "config.json" (
 ) else (
     copy /y "config.json.example" "%DIST%\config.json" >nul
 )
+if exist "CHANGELOG.md" copy /y "CHANGELOG.md" "%DIST%\CHANGELOG.md" >nul
 
 if not exist "models" (
     echo [VoiceTexter] Папка models не найдена - приложение покажет "нет моделей".

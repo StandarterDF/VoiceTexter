@@ -87,6 +87,14 @@ class VoiceTexterApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.cfg = config.load_config()
+        # Миграция: прежний дефолт окна энкодера (10 с) заставлял Whisper
+        # повторять фразы целиком. Поднимаем до безопасных 20 с (значения
+        # 8/12/15/30, выбранные пользователем вручную, не трогаем).
+        try:
+            if float(self.cfg.get("pad_seconds", 0) or 0) == 10.0:
+                self.cfg["pad_seconds"] = 20.0
+        except (TypeError, ValueError):
+            pass
         self.title("VoiceTexter")
 
         # --- внутреннее состояние (читается и из потоков слушателей) ---
@@ -123,12 +131,12 @@ class VoiceTexterApp(ctk.CTk):
         self.recorder = Recorder(samplerate=int(self.cfg.get("samplerate", 16000)))
         self.transcriber = Transcriber()
         self.transcriber.pad_seconds = float(
-            self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 10.0))
+            self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 20.0))
         )
         transcriber_configure(self.transcriber.pad_seconds)
         self.hotkeys = HotkeyManager(self._on_activate, self._on_deactivate)
 
-        # Именованный мьютекс: замечаем уже работающую копию (для запуска из исходников).
+        # Именованный мьютекс (идемпотентно): замечаем уже работающую копию.
         instances.init()
 
         self._build_ui()
@@ -579,6 +587,7 @@ class VoiceTexterApp(ctk.CTk):
 
         # Клип кодируется окном не 30 с, а этим значением — меньше задержка
         # на коротких фразах, и на CPU, и на GPU (30 = как в оригинале Whisper).
+        # Окна <= 12 с могут вызывать повторы фразы, поэтому по умолчанию 20.
         label("Окно энкодера (с)")
         self.padwin_combo = combo(
             ["8", "10", "12", "15", "20", "30"], self._on_setting_change
@@ -924,7 +933,16 @@ class VoiceTexterApp(ctk.CTk):
         )
         self._log("Устанавливаю обновление и перезапускаюсь…")
         self._force_quit = True
-        self.after(500, self._on_close)
+        # Гарантированно завершаем процесс, иначе .bat будет вечно ждать PID.
+        self.after(400, self._quit_for_update)
+
+    def _quit_for_update(self) -> None:
+        """Жёстко выйти, чтобы установщик смог подменить файлы и перезапустить."""
+        try:
+            self._on_close()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
 
     def _on_app_update_error(self, message: str) -> None:
         self._app_updating = False
@@ -1272,7 +1290,7 @@ class VoiceTexterApp(ctk.CTk):
                 ["8", "10", "12", "15", "20", "30"],
                 str(
                     int(
-                        self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 10))
+                        self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 20))
                     )
                 ),
             )
@@ -1340,7 +1358,7 @@ class VoiceTexterApp(ctk.CTk):
             self._pad_seconds = float(self.padwin_combo.get())
         except (ValueError, AttributeError):
             self._pad_seconds = float(
-                self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 10))
+                self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 20))
             )
         # Применяем сразу — окно энкодера не требует перезагрузки модели.
         self.transcriber.pad_seconds = self._pad_seconds
@@ -2221,6 +2239,11 @@ class VoiceTexterApp(ctk.CTk):
 
 
 def main() -> None:
+    # Вторая копия не запускается: копии делят микрофон/хоткей/буфер и по
+    # полной модели в памяти (лишний расход CPU и RAM). Разрешить несколько
+    # копий можно через VOICETEXTER_ALLOW_MULTI=1.
+    if instances.block_if_running():
+        return
     app = VoiceTexterApp()
     app.mainloop()
 
