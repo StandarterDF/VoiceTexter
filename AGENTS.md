@@ -144,23 +144,30 @@ VoiceTexter.spec, build_exe.bat, requirements-build.txt — PyInstaller build
   older versions), shows a native `MessageBoxW` and returns, so no window is built.
   `VOICETEXTER_ALLOW_MULTI=1` disables the block for dev/testing. `init()` is idempotent
   (always creates the mutex; repeated calls don't mistake our own copy for another).
-  The banner + `_poll_instances()` (every 4 s, main thread) remain as a safety net for
-  copies that start *after* us; detection must never raise — degrade to `others() == 0`.
+  There is **no periodic banner** — because a second copy is blocked before its UI
+  exists, a poll would only ever see the *transient* blocked copy (still showing its
+  `MessageBoxW`) and raise a false "another copy is running" warning, so the header
+  banner and `_poll_instances()` were removed. Detection must never raise.
 - **Encoder window (transcriber.py)** = Whisper/CT2 always pad the mel to 30 s
   (3000 frames) and encode the whole window, even for a 2 s clip — this fixed cost
   dominates CPU latency (~6 s, large-v3-turbo) and is a big chunk on GPU too, independent
-  of clip length. So we monkey-patch `faster_whisper.transcribe.pad_or_trim` (installed
+  of clip length. We monkey-patch `faster_whisper.transcribe.pad_or_trim` (installed
   lazily on `load()`; no faster-whisper import at startup) to pad only to
   `max(real_frames, floor)` where `floor = pad_seconds * 100`. Applies to **both CPU and
-  GPU**. `pad_seconds` (config key, **default 20**, `30` = stock; old key `cpu_pad_seconds`
-  is migrated and dropped; old value `10` is auto-bumped to `20`) is exposed as the «Окно
-  энкодера (с)» combobox; `transcriber.configure(pad_seconds=…)` applies it live without a
-  model reload. **Windows ≤ 12 s make Whisper loop** (repeat the whole phrase — Whisper was
-  trained only on 30 s windows), which both garbles the text *and* makes it **slower** (extra
-  tokens); `no_repeat_ngram_size=3` is passed as a guard. Real Russian TTS, CPU, 4 clips
-  (2.5/5.6/7/13 s): pad 30 → 25.7 s clean; pad 10 → repeats on 2/4; pad 20 → 14.9 s clean
-  (~1.7×). The patch is guarded (no-op if the internal name is missing); keep the window
-  ≥ 15, default 20.
+  GPU**. `pad_seconds` (config key, **default 30 = stock**, max 30; old key `cpu_pad_seconds`
+  is migrated and dropped) is exposed as the «Окно энкодера (с)» combobox;
+  `transcriber.configure(pad_seconds=…)` applies it live without a model reload.
+  **Lowering the window is NOT safe on real speech**: Whisper was trained only on 30 s
+  windows, and a smaller window makes it (a) **loop/repeat the whole phrase** (≤ 12 s) and
+  (b) **hallucinate extra trailing words** — e.g. «Продолжение следует…», «Субтитры сделал
+  DimaTorzok» — often with a timestamp **past the real audio length**. That is why the
+  default is back to 30 (stock). Two guards remain for the case where a user lowers it:
+  `no_repeat_ngram_size=3` (anti-repetition), and `Transcriber.transcribe` **drops any
+  segment whose `start` is beyond the audio duration + 0.5 s** (the tail hallucination gets
+  an out-of-range timestamp and is discarded). A one-time migration in `main.py`
+  (`pad_seconds_v` marker) bumps any saved `< 30` value to 30 so old installs are fixed
+  without clobbering a later deliberate choice. The patch is guarded (no-op if the internal
+  name is missing).
 - **Device/compute resolution**: `auto` → `cuda` iff `transcriber.cuda_available()`
   (loads `nvcuda.dll` / `libcuda.so`), else `cpu`; compute `auto` → `float16` on
   CUDA, `int8` on CPU. Reloading with a new device/compute swaps the model.

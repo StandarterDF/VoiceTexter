@@ -87,14 +87,16 @@ class VoiceTexterApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.cfg = config.load_config()
-        # Миграция: прежний дефолт окна энкодера (10 с) заставлял Whisper
-        # повторять фразы целиком. Поднимаем до безопасных 20 с (значения
-        # 8/12/15/30, выбранные пользователем вручную, не трогаем).
-        try:
-            if float(self.cfg.get("pad_seconds", 0) or 0) == 10.0:
-                self.cfg["pad_seconds"] = 20.0
-        except (TypeError, ValueError):
-            pass
+        # Одноразовая миграция окна энкодера: любое окно < 30 с заставляло
+        # Whisper галлюцинировать/повторять текст, поэтому поднимаем до штатных
+        # 30 с. Маркер не даёт сбрасывать сделанный позже осознанный выбор.
+        if int(self.cfg.get("pad_seconds_v", 0) or 0) < 2:
+            try:
+                if float(self.cfg.get("pad_seconds", 30) or 30) < 30:
+                    self.cfg["pad_seconds"] = 30.0
+            except (TypeError, ValueError):
+                pass
+            self.cfg["pad_seconds_v"] = 2
         self.title("VoiceTexter")
 
         # --- внутреннее состояние (читается и из потоков слушателей) ---
@@ -126,12 +128,11 @@ class VoiceTexterApp(ctk.CTk):
         self._paste_method: str = "Ctrl+V"
         self._vad: bool = True
         self._devices: list[tuple[int, str]] = []
-        self._other_instances = 0  # сколько ещё копий VoiceTexter запущено
 
         self.recorder = Recorder(samplerate=int(self.cfg.get("samplerate", 16000)))
         self.transcriber = Transcriber()
         self.transcriber.pad_seconds = float(
-            self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 20.0))
+            self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 30.0))
         )
         transcriber_configure(self.transcriber.pad_seconds)
         self.hotkeys = HotkeyManager(self._on_activate, self._on_deactivate)
@@ -153,7 +154,6 @@ class VoiceTexterApp(ctk.CTk):
         self._setup_tray()
         self.after(80, self._drain_events)
         self.after(40, self._animate)
-        self.after(600, self._poll_instances)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if config.list_models():
@@ -368,18 +368,6 @@ class VoiceTexterApp(ctk.CTk):
             head, text="push-to-talk", font=self.f_small, text_color=PALETTE["faint"]
         ).grid(row=0, column=1, sticky="e")
 
-        self.instance_warn = ctk.CTkLabel(
-            head,
-            text="",
-            font=self.f_small,
-            text_color=PALETTE["busy"],
-            anchor="w",
-            justify="left",
-            wraplength=440,
-        )
-        self.instance_warn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        self.instance_warn.grid_remove()
-
         # --- Карточка статуса ---
         card = ctk.CTkFrame(root, fg_color=PALETTE["panel"], corner_radius=18)
         card.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -586,13 +574,11 @@ class VoiceTexterApp(ctk.CTk):
         self.beam_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
-        # Клип кодируется окном не 30 с, а этим значением — меньше задержка
-        # на коротких фразах, и на CPU, и на GPU (30 = как в оригинале Whisper).
-        # Окна <= 12 с могут вызывать повторы фразы, поэтому по умолчанию 20.
+        # Окно энкодера. Уменьшение (< 30 с) даёт ускорение, но Whisper обучен
+        # на 30-секундных окнах и на реальной речи начинает галлюцинировать
+        # (дописывать лишние слова) — поэтому по умолчанию 30 (штатно).
         label("Окно энкодера (с)")
-        self.padwin_combo = combo(
-            ["8", "10", "12", "15", "20", "30"], self._on_setting_change
-        )
+        self.padwin_combo = combo(["15", "20", "25", "30"], self._on_setting_change)
         self.padwin_combo.grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
@@ -1295,10 +1281,10 @@ class VoiceTexterApp(ctk.CTk):
         )
         self.padwin_combo.set(
             self._pick(
-                ["8", "10", "12", "15", "20", "30"],
+                ["15", "20", "25", "30"],
                 str(
                     int(
-                        self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 20))
+                        self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 30))
                     )
                 ),
             )
@@ -1367,7 +1353,7 @@ class VoiceTexterApp(ctk.CTk):
             self._pad_seconds = float(self.padwin_combo.get())
         except (ValueError, AttributeError):
             self._pad_seconds = float(
-                self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 20))
+                self.cfg.get("pad_seconds", self.cfg.get("cpu_pad_seconds", 30))
             )
         # Применяем сразу — окно энкодера не требует перезагрузки модели.
         self.transcriber.pad_seconds = self._pad_seconds
@@ -1450,40 +1436,6 @@ class VoiceTexterApp(ctk.CTk):
         except queue.Empty:
             pass
         self.after(80, self._drain_events)
-
-    def _poll_instances(self) -> None:
-        """Периодически проверяем, не запущена ли ещё копия VoiceTexter."""
-        if self._closing:
-            return
-        count = instances.other_count()
-        if count != self._other_instances:
-            self._other_instances = count
-            if count:
-                self._log(
-                    f"⚠ Обнаружена ещё одна запущенная копия VoiceTexter "
-                    f"(всего ещё {count}). Копии делят хоткей, микрофон, "
-                    f"буфер обмена и config.json."
-                )
-            else:
-                self._log("Другие копии VoiceTexter не обнаружены.")
-            self._update_instance_warning()
-        self.after(4000, self._poll_instances)
-
-    def _update_instance_warning(self) -> None:
-        try:
-            if self._other_instances:
-                self.instance_warn.configure(
-                    text=(
-                        f"⚠ Запущено ещё копий VoiceTexter: {self._other_instances}. "
-                        "Они одновременно читают микрофон, перехватывают хоткей "
-                        "и буфер обмена."
-                    )
-                )
-                self.instance_warn.grid()
-            else:
-                self.instance_warn.grid_remove()
-        except Exception:  # noqa: BLE001
-            pass
 
     def _handle_event(self, event: tuple) -> None:
         kind = event[0]

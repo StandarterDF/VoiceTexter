@@ -121,11 +121,6 @@ def others() -> int:
         return 0
 
 
-def other_count() -> int:
-    """Совместимый алиас для периодической проверки в UI."""
-    return others()
-
-
 def _notify(text: str) -> None:
     """Показать нативное окно Windows (без Tk), не роняя приложение."""
     try:
