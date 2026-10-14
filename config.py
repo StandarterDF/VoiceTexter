@@ -7,9 +7,35 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+
+def _base_dir() -> Path:
+    """Рабочая папка приложения (рядом с .py либо рядом с .exe).
+
+    В собранном PyInstaller-приложении ``__file__`` указывает внутрь
+    временной/_internal-папки, поэтому ``config.json`` и ``models/`` ищем
+    рядом с исполняемым файлом — это делает сборку переносимой.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resource_path(relative: str) -> Path:
+    """Путь к упакованному ресурсу (assets/…): _MEIPASS при сборке, иначе корень."""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    else:
+        base = ROOT
+    candidate = base / relative
+    if candidate.exists():
+        return candidate
+    return ROOT / relative
+
+
+ROOT = _base_dir()
 MODELS_DIR = ROOT / "models"
 CONFIG_PATH = ROOT / "config.json"
 
@@ -29,6 +55,8 @@ DEFAULT_CONFIG: dict = {
     "paste_method": "Ctrl+V",
     "preload_on_start": True,
     "samplerate": 16000,
+    "minimize_to_tray": True,  # закрытие окна = свернуть в трей, а не выход
+    "start_minimized": False,  # запускать сразу в трее
 }
 
 

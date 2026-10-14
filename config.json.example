@@ -14,5 +14,7 @@
   "vad_filter": true,
   "beam_size": 1,
   "preload_on_start": true,
-  "samplerate": 16000
+  "samplerate": 16000,
+  "minimize_to_tray": true,
+  "start_minimized": false
 }

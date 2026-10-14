@@ -18,3 +18,9 @@ __pycache__/
 *.log
 logs/
 temp/
+
+# Сборка EXE (PyInstaller)
+build/
+dist/
+*.manifest
+

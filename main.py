@@ -22,6 +22,7 @@ from hotkeys import HotkeyManager, binding_label
 from paster import paste_text
 from recorder import Recorder, list_input_devices
 from transcriber import Transcriber, cuda_available
+from tray import TrayController, load_image, tray_available
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -85,6 +86,8 @@ class VoiceTexterApp(ctk.CTk):
         self._listening = True
         self._capturing = False
         self._closing = False
+        self._force_quit = False
+        self._tray: TrayController | None = None
         self._state = "idle"
         self._model_detail = ""
         self._phase = 0.0
@@ -113,9 +116,14 @@ class VoiceTexterApp(ctk.CTk):
 
         self._set_status("idle", "Готов к работе", "Модель загружается…")
         self._log("VoiceTexter запущен.")
+        self._setup_window_icon()
+        self._setup_tray()
         self.after(80, self._drain_events)
         self.after(40, self._animate)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        if self.cfg.get("start_minimized") and self._tray is not None:
+            self.after(50, self.hide_to_tray)
 
         if self.cfg.get("preload_on_start", True):
             self.after(200, self._preload_model)
@@ -129,6 +137,67 @@ class VoiceTexterApp(ctk.CTk):
         x = max(0, (self.winfo_screenwidth() - width) // 2)
         y = max(0, (self.winfo_screenheight() - height) // 3)
         self.geometry(f"{width}x{height}+{x}+{y}")
+
+    # -------------------------------------------------------- иконка и трей
+
+    def _setup_window_icon(self) -> None:
+        ico = config.resource_path("assets/icon.ico")
+        png = config.resource_path("assets/icon.png")
+        try:
+            if ico.exists():
+                self.iconbitmap(str(ico))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if png.exists():
+                self._icon_photo = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._icon_photo)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _tray_title(self) -> str:
+        state = "включено" if self._listening else "пауза"
+        return f"VoiceTexter — прослушивание {state}"
+
+    def _setup_tray(self) -> None:
+        """Создать значок в трее (если установлены pystray и Pillow)."""
+        if not tray_available():
+            self._log("Трей недоступен (нет pystray/Pillow).")
+            return
+        image = load_image(config.resource_path("assets/icon.png"))
+        if image is None:
+            self._log("Не удалось загрузить значок для трея.")
+            return
+        try:
+            self._tray = TrayController(
+                image,
+                on_show=lambda: self._post(("tray_show",)),
+                on_toggle_listening=lambda: self._post(("tray_toggle",)),
+                on_quit=lambda: self._post(("tray_quit",)),
+                listening=self._listening,
+                title=self._tray_title(),
+                on_failed=lambda: self._post(("tray_failed",)),
+            )
+            self._tray.start()
+        except Exception as exc:  # noqa: BLE001
+            self._tray = None
+            self._log(f"Трей недоступен: {exc}")
+
+    def hide_to_tray(self) -> None:
+        """Спрятать окно (и значок на панели задач), оставив приложение жить."""
+        if self._tray is None:
+            self._on_close()
+            return
+        self.withdraw()
+        self._log("Свёрнуто в трей — приложение продолжает слушать микрофон.")
+
+    def show_window(self) -> None:
+        self.deiconify()
+        self.lift()
+        try:
+            self.focus_force()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ----------------------------------------------------------------- UI
 
@@ -406,6 +475,11 @@ class VoiceTexterApp(ctk.CTk):
         self.vad_var = ctk.BooleanVar(value=True)
         check("Отсекать тишину (VAD)", self.vad_var)
 
+        self.tray_var = ctk.BooleanVar(value=True)
+        check("Сворачивать в трей при закрытии окна", self.tray_var)
+        self.start_min_var = ctk.BooleanVar(value=False)
+        check("Запускать сразу свёрнутым в трей", self.start_min_var)
+
         ctk.CTkLabel(
             parent,
             text="Начальный промпт (для смешанной ru+en речи)",
@@ -517,6 +591,8 @@ class VoiceTexterApp(ctk.CTk):
         self.restore_var.set(bool(self.cfg.get("restore_clipboard", True)))
         self.space_var.set(bool(self.cfg.get("trailing_space", True)))
         self.vad_var.set(bool(self.cfg.get("vad_filter", True)))
+        self.tray_var.set(bool(self.cfg.get("minimize_to_tray", True)))
+        self.start_min_var.set(bool(self.cfg.get("start_minimized", False)))
 
     @staticmethod
     def _pick(values, current):
@@ -574,6 +650,8 @@ class VoiceTexterApp(ctk.CTk):
                 "beam_size": self._beam_size,
                 "initial_prompt": self._initial_prompt,
                 "paste_method": self._paste_method,
+                "minimize_to_tray": self.tray_var.get(),
+                "start_minimized": self.start_min_var.get(),
             }
         )
         config.save_config(self.cfg)
@@ -664,6 +742,17 @@ class VoiceTexterApp(ctk.CTk):
             self._log(f"Ошибка распознавания: {event[1]}")
         elif kind == "binding":
             self._apply_binding(event[1])
+        elif kind == "tray_show":
+            self.show_window()
+        elif kind == "tray_toggle":
+            self._toggle_listening()
+        elif kind == "tray_quit":
+            self._force_quit = True
+            self._on_close()
+        elif kind == "tray_failed":
+            self._tray = None
+            self.show_window()
+            self._log("Значок в трее недоступен — окно показано снова.")
 
     # --------------------------------------------- запись (из потока hotkey)
 
@@ -809,6 +898,9 @@ class VoiceTexterApp(ctk.CTk):
             )
             self._set_status("ready", "Готов", self._model_detail)
             self._log("Прослушивание включено.")
+        if self._tray is not None:
+            self._tray.set_listening(self._listening)
+            self._tray.set_title(self._tray_title())
 
     def _log(self, message: str) -> None:
         self.log_box.configure(state="normal")
@@ -817,12 +909,26 @@ class VoiceTexterApp(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _on_close(self) -> None:
+        """Крестик окна: свернуть в трей (по умолчанию) либо выйти."""
+        if self._closing:
+            return
+        if (
+            not self._force_quit
+            and self.cfg.get("minimize_to_tray", True)
+            and self._tray is not None
+        ):
+            self.hide_to_tray()
+            return
+
         self._closing = True
         try:
             self._sync_cached_settings()
         except Exception:  # noqa: BLE001
             pass
         finally:
+            if self._tray is not None:
+                self._tray.stop()
+                self._tray = None
             self.recorder.abort()
             self.hotkeys.stop()
             self.destroy()
