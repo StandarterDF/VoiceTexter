@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_APP_DIR = ROOT / "dist" / "VoiceTexter"
 
 # Что не кладём в архив (верхний уровень папки приложения).
-EXCLUDE_TOP = {"models", "config.json"}
+EXCLUDE_TOP = {"models", "config.json", "update"}
 
 
 def detect_version() -> str:

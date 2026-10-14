@@ -10,15 +10,19 @@
 from __future__ import annotations
 
 import math
+import os
 import queue
+import sys
 import threading
 import tkinter as tk
 import traceback
+from pathlib import Path
 
 import customtkinter as ctk
 
 import config
 import modelstore
+import updater
 from hotkeys import HotkeyManager, binding_label
 from paster import paste_text
 from recorder import Recorder, list_input_devices
@@ -73,6 +77,10 @@ HINTS = {
 
 MIN_AUDIO_SECONDS = 0.25
 
+# Подписи для переключателя устройства; в config.json хранятся значения auto/cuda/cpu.
+DEVICE_LABELS = {"auto": "Авто", "cuda": "GPU", "cpu": "CPU"}
+DEVICE_VALUES = {label: value for value, label in DEVICE_LABELS.items()}
+
 
 class VoiceTexterApp(ctk.CTk):
     def __init__(self) -> None:
@@ -87,12 +95,15 @@ class VoiceTexterApp(ctk.CTk):
         self._loading = False
         self._downloading = False
         self._download_cancel = threading.Event()
+        self._active_folder: str | None = None  # что качается/проверяется сейчас
+        self._dl_kind: str = ""  # "download" | "update" | "check"
+        self._model_notes: dict[str, str] = {}  # папка -> "update"/"actual"/"error"
         self._listening = True
         self._capturing = False
         self._closing = False
         self._force_quit = False
         self._tray: TrayController | None = None
-        self._dlg: dict | None = None
+        self._setup: dict | None = None
         self._state = "idle"
         self._model_detail = ""
         self._phase = 0.0
@@ -114,6 +125,7 @@ class VoiceTexterApp(ctk.CTk):
         self._build_ui()
         self._center_window()
         self._load_settings_into_ui()
+        self._refresh_model_rows_state()
         # Биндинг ставим ДО сохранения конфига, иначе в config.json уйдёт null.
         self.hotkeys.set_binding(self.cfg.get("binding"))
         self._sync_cached_settings()
@@ -140,9 +152,14 @@ class VoiceTexterApp(ctk.CTk):
         if config.list_models() and self.cfg.get("preload_on_start", True):
             self.after(200, self._preload_model)
 
+        # Тихая проверка обновлений — чтобы кнопка «Обновить» появлялась
+        # только когда обновление реально есть.
+        if config.list_models():
+            self.after(2500, lambda: self._check_updates(silent=True))
+
         if not config.list_models() and not self.cfg.get("start_minimized"):
-            # Первый запуск без моделей — сразу предложим скачать.
-            self.after(350, self._open_download_dialog)
+            # Первый запуск без моделей — сразу предложим настроить и скачать.
+            self.after(350, self._show_setup)
 
     # --------------------------------------------------------------- окно
 
@@ -171,9 +188,23 @@ class VoiceTexterApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
 
+    def _device_mode(self) -> str:
+        """Выбранный режим устройства: auto | cuda | cpu (из переключателя)."""
+        try:
+            return DEVICE_VALUES.get(self.device_var.get(), "auto")
+        except Exception:  # noqa: BLE001
+            return "auto"
+
+    def _set_device_mode(self, value: str) -> None:
+        mode = value if value in DEVICE_LABELS else "auto"
+        try:
+            self.device_var.set(DEVICE_LABELS[mode])
+        except Exception:  # noqa: BLE001
+            pass
+
     def _tray_title(self) -> str:
-        device = {"auto": "авто", "cpu": "CPU", "cuda": "GPU"}.get(
-            self.device_combo.get(), self.device_combo.get()
+        device = {"auto": "авто", "cuda": "GPU", "cpu": "CPU"}.get(
+            self._device_mode(), self._device_mode()
         )
         state = "вкл" if self._listening else "пауза"
         return f"VoiceTexter — {device}, {state}"
@@ -182,9 +213,9 @@ class VoiceTexterApp(ctk.CTk):
         """Текущие настройки для галочек в меню трея (только главный поток)."""
         return {
             "listening": self._listening,
-            "device": self.device_combo.get(),
+            "device": self._device_mode(),
             "compute_type": self.compute_combo.get(),
-            "model": self.model_combo.get(),
+            "model": self._model_name,
             "language": self._lang,
             "auto_paste": self.auto_paste_var.get(),
             "vad": self._vad,
@@ -250,11 +281,12 @@ class VoiceTexterApp(ctk.CTk):
         """Применить быструю настройку из меню трея (главный поток)."""
         try:
             if name == "device":
-                self.device_combo.set(str(value))
+                self._set_device_mode(str(value))
             elif name == "compute_type":
                 self.compute_combo.set(str(value))
             elif name == "model":
-                self.model_combo.set(str(value))
+                self._model_name = str(value)
+                self._refresh_model_rows_state()
             elif name == "language":
                 self.lang_combo.set(str(value))
             elif name == "auto_paste":
@@ -292,6 +324,9 @@ class VoiceTexterApp(ctk.CTk):
         self.f_section = ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")
         self.f_chip = ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
         self.f_label = ctk.CTkFont(family=FONT_FAMILY, size=12)
+
+        # Общая галочка «через прокси» — показывается и в «Моделях», и в «Настройках».
+        self.proxy_var = ctk.BooleanVar(value=False)
 
         root = ctk.CTkScrollableFrame(
             self,
@@ -371,7 +406,7 @@ class VoiceTexterApp(ctk.CTk):
             border_color=PALETTE["accent"],
             border_width=1,
             text_color=PALETTE["accent"],
-            command=self._open_download_dialog,
+            command=self._show_setup,
         )
         self.download_card_btn.grid(row=3, column=0, padx=24, pady=(0, 14), sticky="ew")
 
@@ -422,14 +457,24 @@ class VoiceTexterApp(ctk.CTk):
         )
         self.toggle_btn.grid(row=3, column=0, sticky="ew", pady=(14, 0))
 
+        # --- Обновление программы (сворачиваемое) ---
+        upd_wrap, upd = self._make_section(root, "Обновление программы")
+        upd_wrap.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self._build_update_section(upd)
+
+        # --- Модели (сворачиваемые) ---
+        models_wrap, models = self._make_section(root, "Модели", opened=True)
+        models_wrap.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        self._build_models_section(models)
+
         # --- Настройки (сворачиваемые) ---
         settings_wrap, settings = self._make_section(root, "Настройки")
-        settings_wrap.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        settings_wrap.grid(row=6, column=0, sticky="ew", pady=(12, 0))
         self._build_settings(settings)
 
         # --- Журнал (сворачиваемый) ---
         log_wrap, log = self._make_section(root, "Журнал")
-        log_wrap.grid(row=5, column=0, sticky="new", pady=(6, 0))
+        log_wrap.grid(row=7, column=0, sticky="new", pady=(6, 0))
         self.log_box = ctk.CTkTextbox(
             log,
             height=140,
@@ -454,9 +499,9 @@ class VoiceTexterApp(ctk.CTk):
                 parent, text=text, font=self.f_label, text_color=PALETTE["muted"]
             ).grid(row=row, column=0, padx=(4, 10), pady=6, sticky="w")
 
-        def combo(values, command):
+        def combo(values, command, master=None):
             return ctk.CTkComboBox(
-                parent,
+                master if master is not None else parent,
                 values=values,
                 command=command,
                 fg_color=PALETTE["panel_2"],
@@ -473,14 +518,23 @@ class VoiceTexterApp(ctk.CTk):
                 font=self.f_body,
             )
 
-        label("Модель")
-        self.model_combo = combo(self._model_values(), self._on_model_change)
-        self.model_combo.grid(row=row, column=1, pady=6, sticky="ew")
-        row += 1
-
         label("Устройство")
-        self.device_combo = combo(["auto", "cuda", "cpu"], self._on_model_change)
-        self.device_combo.grid(row=row, column=1, pady=6, sticky="ew")
+        self.device_var = ctk.StringVar(value=DEVICE_LABELS["auto"])
+        ctk.CTkSegmentedButton(
+            parent,
+            values=list(DEVICE_LABELS.values()),
+            variable=self.device_var,
+            command=lambda _v: self._on_model_change(),
+            font=self.f_body,
+            fg_color=PALETTE["panel_2"],
+            selected_color=PALETTE["accent"],
+            selected_hover_color=PALETTE["accent_hover"],
+            unselected_color=PALETTE["panel_2"],
+            unselected_hover_color=PALETTE["border"],
+            text_color=PALETTE["text"],
+            corner_radius=9,
+            height=34,
+        ).grid(row=row, column=1, pady=6, sticky="ew")
         row += 1
 
         label("Точность")
@@ -510,7 +564,9 @@ class VoiceTexterApp(ctk.CTk):
         mic_frame = ctk.CTkFrame(parent, fg_color="transparent")
         mic_frame.grid(row=row, column=1, pady=6, sticky="ew")
         mic_frame.grid_columnconfigure(0, weight=1)
-        self.mic_combo = combo(self._device_values(), self._on_setting_change)
+        self.mic_combo = combo(
+            self._device_values(), self._on_setting_change, master=mic_frame
+        )
         self.mic_combo.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(
             mic_frame,
@@ -539,47 +595,6 @@ class VoiceTexterApp(ctk.CTk):
             corner_radius=9,
             command=self._preload_model,
         ).grid(row=row, column=0, columnspan=2, pady=(10, 4), sticky="ew")
-        row += 1
-
-        label("Скачать модель")
-        dl_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        dl_frame.grid(row=row, column=1, pady=6, sticky="ew")
-        dl_frame.grid_columnconfigure(0, weight=1)
-        self.download_combo = combo(self._download_labels(), lambda *_: None)
-        self.download_combo.grid(row=0, column=0, sticky="ew")
-        self.download_btn = ctk.CTkButton(
-            dl_frame,
-            text="⬇",
-            width=34,
-            height=34,
-            font=self.f_body,
-            fg_color=PALETTE["accent"],
-            hover_color=PALETTE["accent_hover"],
-            text_color="#0d0f14",
-            corner_radius=9,
-            command=self._on_download_button,
-        )
-        self.download_btn.grid(row=0, column=1, padx=(6, 0))
-        row += 1
-
-        self.download_status = ctk.CTkLabel(
-            parent, text="", font=self.f_small, text_color=PALETTE["faint"]
-        )
-        self.download_status.grid(row=row, column=0, columnspan=2, padx=4, sticky="w")
-        row += 1
-
-        self.download_bar = ctk.CTkProgressBar(
-            parent,
-            height=8,
-            corner_radius=4,
-            fg_color=PALETTE["panel_2"],
-            progress_color=PALETTE["accent"],
-        )
-        self.download_bar.set(0)
-        self.download_bar.grid(
-            row=row, column=0, columnspan=2, padx=4, pady=(2, 6), sticky="ew"
-        )
-        self.download_bar.grid_remove()
         row += 1
 
         ctk.CTkFrame(parent, height=1, fg_color=PALETTE["border"]).grid(
@@ -623,10 +638,9 @@ class VoiceTexterApp(ctk.CTk):
         )
         row += 1
 
-        self.proxy_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             parent,
-            text="Прокси для загрузки моделей",
+            text="Прокси для загрузки моделей и обновлений",
             variable=self.proxy_var,
             command=self._on_setting_change,
             font=self.f_body,
@@ -693,6 +707,471 @@ class VoiceTexterApp(ctk.CTk):
         )
         self.test_entry.grid(row=row, column=0, columnspan=2, padx=2, sticky="ew")
 
+    # -------------------------------------------------- обновление программы
+
+    def _build_update_section(self, parent) -> None:
+        self._app_update: dict | None = None
+        self._app_updating = False
+
+        ctk.CTkLabel(
+            parent,
+            text=f"Установлена версия {updater.app_version()}",
+            font=self.f_body,
+            text_color=PALETTE["text"],
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, padx=4, sticky="w")
+
+        self.app_update_status = ctk.CTkLabel(
+            parent,
+            text="",
+            font=self.f_small,
+            text_color=PALETTE["muted"],
+            anchor="w",
+            wraplength=380,
+            justify="left",
+        )
+        self.app_update_status.grid(
+            row=1, column=0, columnspan=2, padx=4, pady=(2, 0), sticky="ew"
+        )
+
+        self.app_update_bar = ctk.CTkProgressBar(
+            parent,
+            height=8,
+            corner_radius=4,
+            fg_color=PALETTE["panel_2"],
+            progress_color=PALETTE["accent"],
+        )
+        self.app_update_bar.set(0)
+        self.app_update_bar.grid(
+            row=2, column=0, columnspan=2, padx=4, pady=(6, 0), sticky="ew"
+        )
+        self.app_update_bar.grid_remove()
+
+        self.app_check_btn = ctk.CTkButton(
+            parent,
+            text="⟳   Проверить обновления",
+            font=self.f_body,
+            height=36,
+            corner_radius=9,
+            fg_color="transparent",
+            hover_color=PALETTE["panel_2"],
+            border_color=PALETTE["border"],
+            border_width=1,
+            text_color=PALETTE["text"],
+            command=self._check_app_update,
+        )
+        self.app_check_btn.grid(
+            row=3, column=0, columnspan=2, padx=4, pady=(8, 0), sticky="ew"
+        )
+
+        self.app_install_btn = ctk.CTkButton(
+            parent,
+            text="⬇   Скачать и установить",
+            font=self.f_body,
+            height=38,
+            corner_radius=10,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color="#0d0f14",
+            command=self._install_app_update,
+        )
+        self.app_install_btn.grid(
+            row=4, column=0, columnspan=2, padx=4, pady=(6, 0), sticky="ew"
+        )
+        self.app_install_btn.grid_remove()
+
+    def _check_app_update(self) -> None:
+        if self._app_updating:
+            return
+        self._app_updating = True
+        self._app_update = None
+        self.app_install_btn.grid_remove()
+        self.app_check_btn.configure(state="disabled")
+        self.app_update_status.configure(
+            text="Проверяю обновления на GitHub…", text_color=PALETTE["busy"]
+        )
+        proxy = self._download_proxy()
+        threading.Thread(
+            target=self._app_check_worker, args=(proxy,), daemon=True
+        ).start()
+
+    def _app_check_worker(self, proxy: str) -> None:
+        try:
+            info = updater.fetch_latest(proxy_url=proxy)
+        except Exception as exc:  # noqa: BLE001
+            self._post(("app_update_error", f"{type(exc).__name__}: {exc}"))
+            return
+        self._post(("app_update_checked", info))
+
+    def _install_app_update(self) -> None:
+        info = self._app_update
+        if info is None or self._app_updating:
+            return
+        if not updater.can_self_update():
+            self._log(
+                "Автоустановка доступна только для собранной версии (EXE). "
+                "Скачайте архив со страницы релизов GitHub."
+            )
+            return
+        self._app_updating = True
+        self.app_check_btn.configure(state="disabled")
+        self.app_install_btn.configure(state="disabled")
+        self.app_update_status.configure(
+            text="Скачиваю обновление…", text_color=PALETTE["busy"]
+        )
+        self.app_update_bar.set(0)
+        self.app_update_bar.grid()
+        proxy = self._download_proxy()
+        threading.Thread(
+            target=self._app_install_worker, args=(info, proxy), daemon=True
+        ).start()
+
+    def _app_install_worker(self, info: dict, proxy: str) -> None:
+        try:
+            app_dir = Path(sys.executable).resolve().parent
+            work = app_dir / "update"
+            work.mkdir(parents=True, exist_ok=True)
+            zip_path = work / (info.get("asset_name") or "VoiceTexter-update.zip")
+
+            def on_progress(done: int, total: int | None) -> None:
+                pct = int(done * 100 / total) if total else None
+                self._post(("app_update_progress", pct))
+
+            updater.download_asset(
+                proxy,
+                info["asset_url"],
+                zip_path,
+                digest=info.get("digest"),
+                on_progress=on_progress,
+            )
+            src = updater.extract_release(zip_path, work)
+            bat = updater.write_updater(work, src, app_dir, os.getpid())
+            self._post(("app_update_ready", str(bat)))
+        except Exception as exc:  # noqa: BLE001
+            self._post(("app_update_error", f"{type(exc).__name__}: {exc}"))
+
+    def _on_app_update_checked(self, info: dict) -> None:
+        self._app_updating = False
+        try:
+            self.app_check_btn.configure(state="normal")
+        except Exception:  # noqa: BLE001
+            pass
+        current = updater.app_version()
+        latest = str(info.get("version") or "")
+        if latest and updater.is_newer(latest, current) and info.get("asset_url"):
+            self._app_update = info
+            self.app_update_status.configure(
+                text=f"Доступна версия {latest} (у вас {current}).",
+                text_color=PALETTE["busy"],
+            )
+            if updater.can_self_update():
+                self.app_install_btn.grid()
+            else:
+                self.app_install_btn.grid_remove()
+                self._log(
+                    "Автоустановка доступна только для EXE. Страница релиза: "
+                    + str(info.get("url") or "")
+                )
+        else:
+            self._app_update = None
+            self.app_install_btn.grid_remove()
+            self.app_update_status.configure(
+                text=f"У вас последняя версия ({current}).",
+                text_color=PALETTE["ok"],
+            )
+        self._log(f"Проверка обновлений: последняя версия {latest or '?'}.")
+
+    def _on_app_update_ready(self, bat_path: str) -> None:
+        try:
+            updater.launch_updater(Path(bat_path))
+        except Exception as exc:  # noqa: BLE001
+            self._on_app_update_error(f"{type(exc).__name__}: {exc}")
+            return
+        self.app_update_status.configure(
+            text="Обновление загружено — приложение перезапустится.",
+            text_color=PALETTE["ok"],
+        )
+        self._log("Устанавливаю обновление и перезапускаюсь…")
+        self._force_quit = True
+        self.after(500, self._on_close)
+
+    def _on_app_update_error(self, message: str) -> None:
+        self._app_updating = False
+        try:
+            self.app_update_bar.grid_remove()
+            self.app_check_btn.configure(state="normal")
+            self.app_install_btn.configure(state="normal")
+        except Exception:  # noqa: BLE001
+            pass
+        self.app_update_status.configure(
+            text=f"Не удалось проверить/скачать: {message}",
+            text_color=PALETTE["record"],
+        )
+        self._log(f"Ошибка обновления программы: {message}")
+
+    # ------------------------------------------------------------ модели
+
+    def _build_models_section(self, parent) -> None:
+        """Список всех моделей со статусом и кнопкой, общие действия."""
+        self.models_rows: dict[str, dict] = {}
+
+        self.models_list = ctk.CTkFrame(parent, fg_color="transparent")
+        self.models_list.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.models_list.grid_columnconfigure(0, weight=1)
+
+        self.download_status = ctk.CTkLabel(
+            parent, text="", font=self.f_small, text_color=PALETTE["faint"], anchor="w"
+        )
+        self.download_status.grid(
+            row=1, column=0, columnspan=2, padx=4, pady=(8, 0), sticky="ew"
+        )
+
+        self.download_bar = ctk.CTkProgressBar(
+            parent,
+            height=8,
+            corner_radius=4,
+            fg_color=PALETTE["panel_2"],
+            progress_color=PALETTE["accent"],
+        )
+        self.download_bar.set(0)
+        self.download_bar.grid(
+            row=2, column=0, columnspan=2, padx=4, pady=(2, 6), sticky="ew"
+        )
+        self.download_bar.grid_remove()
+
+        ctk.CTkCheckBox(
+            parent,
+            text="Скачивать модели через прокси",
+            variable=self.proxy_var,
+            command=self._on_setting_change,
+            font=self.f_small,
+            text_color=PALETTE["text"],
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            border_color=PALETTE["border"],
+            checkmark_color="#0d0f14",
+            corner_radius=5,
+        ).grid(row=3, column=0, columnspan=2, padx=4, pady=(8, 0), sticky="w")
+
+        ctk.CTkLabel(
+            parent,
+            text="Клик по скачанной модели — сделать её основной.",
+            font=self.f_small,
+            text_color=PALETTE["faint"],
+            anchor="w",
+        ).grid(row=4, column=0, columnspan=2, padx=4, pady=(8, 0), sticky="ew")
+
+        self._refresh_models_panel()
+
+    def _model_specs(self) -> list[tuple[str, str | None]]:
+        """[(папка, size|None)] — стандартные модели + нестандартные локальные папки."""
+        specs = [(modelstore.folder_name(s), s) for s in modelstore.known_sizes()]
+        known = {folder for folder, _ in specs}
+        for name in config.list_models():
+            if name not in known:
+                specs.append((name, None))
+        return specs
+
+    def _refresh_models_panel(self) -> None:
+        if not hasattr(self, "models_list"):
+            return
+        for child in self.models_list.winfo_children():
+            child.destroy()
+        self.models_rows = {}
+        for i, (folder, size) in enumerate(self._model_specs()):
+            self._make_model_row(i, folder, size)
+        self._update_primary_action()
+
+    def _update_primary_action(self) -> None:
+        """Кнопка «Скачать модель» нужна только когда моделей нет вовсе."""
+        if not hasattr(self, "download_card_btn"):
+            return
+        try:
+            if config.list_models():
+                self.download_card_btn.grid_remove()
+            else:
+                self.download_card_btn.grid()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _make_model_row(self, index: int, folder: str, size: str | None) -> None:
+        row = ctk.CTkFrame(
+            self.models_list,
+            fg_color=PALETTE["panel_2"],
+            corner_radius=9,
+            border_width=1,
+            border_color=PALETTE["panel_2"],
+        )
+        row.grid(row=index, column=0, sticky="ew", pady=3)
+        row.grid_columnconfigure(0, weight=1)
+
+        approx = f"  ·  {modelstore.approx_size(size)}" if size else ""
+        name = ctk.CTkLabel(
+            row,
+            text=f"{folder}{approx}",
+            font=self.f_body,
+            text_color=PALETTE["text"],
+            anchor="w",
+        )
+        name.grid(row=0, column=0, sticky="w", padx=(10, 6), pady=7)
+
+        status = ctk.CTkLabel(
+            row, text="", font=self.f_small, text_color=PALETTE["muted"]
+        )
+        status.grid(row=0, column=1, padx=6)
+
+        btn = ctk.CTkButton(
+            row,
+            text="Скачать",
+            width=96,
+            height=28,
+            font=self.f_small,
+            corner_radius=8,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color="#0d0f14",
+            command=lambda f=folder: self._model_row_action(f),
+        )
+        btn.grid(row=0, column=2, padx=(6, 8), pady=6)
+
+        self.models_rows[folder] = {
+            "status": status,
+            "btn": btn,
+            "size": size,
+            "row": row,
+            "name": name,
+        }
+        # Клик по строке делает скачанную модель основной.
+        for widget in (row, name, status):
+            widget.bind("<Button-1>", lambda _e, f=folder: self._select_model(f))
+        self._update_model_row(folder)
+
+    def _select_model(self, folder: str) -> None:
+        """Сделать скачанную модель основной (клик по её строке)."""
+        if folder == self._model_name:
+            return
+        if folder not in config.list_models():
+            return
+        self._model_name = folder
+        self._sync_cached_settings()
+        self._refresh_model_rows_state()
+        self._log(f"Основная модель: {folder}.")
+        self._reload_model()
+
+    def _refresh_model_rows_state(self) -> None:
+        for folder in list(self.models_rows):
+            self._update_model_row(folder)
+
+    def _update_model_row(self, folder: str) -> None:
+        info = self.models_rows.get(folder)
+        if info is None:
+            return
+        size, status, btn, row, name = (
+            info["size"],
+            info["status"],
+            info["btn"],
+            info["row"],
+            info["name"],
+        )
+
+        # Подсветка основной (выбранной) модели.
+        is_main = folder == self._model_name and folder in config.list_models()
+        try:
+            row.configure(
+                border_color=PALETTE["accent"] if is_main else PALETTE["panel_2"]
+            )
+            name.configure(text_color=PALETTE["accent"] if is_main else PALETTE["text"])
+        except Exception:  # noqa: BLE001
+            pass
+        prefix = "● " if is_main else ""
+
+        if size is None:
+            # Нестандартная локальная папка — только выбрать основной.
+            status.configure(text="локальная", text_color=PALETTE["muted"])
+            btn.grid_remove()
+            return
+
+        installed = modelstore.is_installed(size, config.MODELS_DIR)
+        if self._downloading and self._dl_kind == "check" and installed:
+            status.configure(text="проверяется…", text_color=PALETTE["busy"])
+            btn.grid_remove()
+            return
+
+        active_op = self._active_folder == folder
+        if self._downloading and active_op and self._dl_kind in ("download", "update"):
+            status.configure(
+                text="скачивается…" if self._dl_kind == "download" else "обновляется…",
+                text_color=PALETTE["busy"],
+            )
+            btn.configure(
+                text="Отмена",
+                state="normal",
+                fg_color=PALETTE["panel_2"],
+                hover_color=PALETTE["border"],
+                border_width=0,
+                text_color=PALETTE["text"],
+            )
+            btn.grid()
+            return
+
+        note = self._model_notes.get(folder)
+        if installed:
+            if note == "update":
+                status.configure(text="доступно обновление", text_color=PALETTE["busy"])
+            elif note == "actual":
+                status.configure(text=f"{prefix}актуально", text_color=PALETTE["ok"])
+            elif note == "error":
+                status.configure(
+                    text="проверка не удалась", text_color=PALETTE["muted"]
+                )
+            else:
+                status.configure(
+                    text=f"{prefix}скачано · {config.model_size_label(folder)}",
+                    text_color=PALETTE["accent"] if is_main else PALETTE["ok"],
+                )
+            # Кнопка «Обновить» — только когда реально есть обновление.
+            if note == "update":
+                btn.configure(
+                    text="Обновить",
+                    state="normal",
+                    fg_color=PALETTE["accent"],
+                    hover_color=PALETTE["accent_hover"],
+                    border_width=0,
+                    text_color="#0d0f14",
+                )
+                btn.grid()
+            else:
+                btn.grid_remove()
+        else:
+            status.configure(text="не скачано", text_color=PALETTE["muted"])
+            btn.configure(
+                text="Скачать",
+                state="normal",
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hover"],
+                border_width=0,
+                text_color="#0d0f14",
+            )
+            btn.grid()
+
+    def _model_row_action(self, folder: str) -> None:
+        info = self.models_rows.get(folder)
+        if info is None or info["size"] is None:
+            return
+        size = info["size"]
+        if (
+            self._downloading
+            and self._active_folder == folder
+            and self._dl_kind in ("download", "update")
+        ):
+            self._download_cancel.set()
+            self._log("Отмена загрузки…")
+            return
+        if modelstore.is_installed(size, config.MODELS_DIR):
+            self._start_update(size, folder)
+        else:
+            self._start_download(size)
+
     def _make_section(self, parent, title: str, opened: bool = False):
         """Сворачиваемая секция. Возвращает (обёртку, контент-фрейм)."""
         wrap = ctk.CTkFrame(parent, fg_color=PALETTE["panel"], corner_radius=14)
@@ -742,8 +1221,9 @@ class VoiceTexterApp(ctk.CTk):
         ]
 
     def _load_settings_into_ui(self) -> None:
-        self.model_combo.set(self._pick(self._model_values(), self.cfg.get("model")))
-        self.device_combo.set(
+        models = config.list_models()
+        self._model_name = self._pick(models, self.cfg.get("model")) if models else ""
+        self._set_device_mode(
             self._pick(["auto", "cuda", "cpu"], self.cfg.get("device"))
         )
         self.compute_combo.set(
@@ -805,8 +1285,7 @@ class VoiceTexterApp(ctk.CTk):
 
     def _sync_cached_settings(self) -> None:
         """Обновить простые кэши и сохранить конфиг (только из главного потока)."""
-        model = self.model_combo.get()
-        self._model_name = model
+        model = self._model_name
         self._input_device = self._selected_device()
         self._lang = self.lang_combo.get()
         try:
@@ -819,7 +1298,7 @@ class VoiceTexterApp(ctk.CTk):
         self.cfg.update(
             {
                 "model": model,
-                "device": self.device_combo.get(),
+                "device": self._device_mode(),
                 "compute_type": self.compute_combo.get(),
                 "language": self._lang,
                 "input_device": self._input_device,
@@ -929,44 +1408,69 @@ class VoiceTexterApp(ctk.CTk):
             self._show_download_progress(size, p)
         elif kind == "download_done":
             self._downloading = False
+            self._dl_kind = ""
+            self._active_folder = None
             self._download_cancel.clear()
             self._hide_download_bars()
-            try:
-                self.download_status.configure(text="")
-            except Exception:  # noqa: BLE001
-                pass
+            self._clear_download_status()
             self._set_status("ready", "Готов", self._model_detail)
             self._after_download(event[1])
-            if self._dlg is not None:
-                try:
-                    self._dlg["bar"].set(1.0)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._dlg_status("Готово — модель скачана и загружается.")
         elif kind == "download_cancelled":
-            self._downloading = False
-            self._download_cancel.clear()
-            self._hide_download_bars()
-            self._update_download_controls()
-            try:
-                self.download_status.configure(text="")
-            except Exception:  # noqa: BLE001
-                pass
-            self._set_status("ready", "Готов", self._model_detail)
+            self._finish_operation()
             self._log("Загрузка отменена.")
-            self._dlg_status("Загрузка отменена.")
         elif kind == "download_error":
-            self._downloading = False
-            self._download_cancel.clear()
-            self._hide_download_bars()
-            self._update_download_controls()
-            try:
-                self.download_status.configure(text="")
-            except Exception:  # noqa: BLE001
-                pass
+            self._finish_operation()
             self._set_status("error", "Ошибка загрузки")
             self._log(f"Не удалось скачать модель: {event[2]}")
-            self._dlg_status(f"Ошибка: {event[2]}")
+        elif kind == "update_status":
+            _kind, folder, note = event
+            self._model_notes[folder] = note
+            self._update_model_row(folder)
+        elif kind == "check_done":
+            silent = len(event) > 1 and bool(event[1])
+            self._finish_operation(silent=silent)
+            if not silent:
+                pending = [f for f, n in self._model_notes.items() if n == "update"]
+                if pending:
+                    self._log(f"Есть обновления: {', '.join(pending)}.")
+                else:
+                    self._log("Все модели актуальны.")
+        elif kind == "update_done":
+            _kind, size, count = event
+            folder = modelstore.folder_name(size)
+            self._downloading = False
+            self._dl_kind = ""
+            self._active_folder = None
+            self._download_cancel.clear()
+            self._hide_download_bars()
+            self._clear_download_status()
+            self._model_notes.pop(folder, None)
+            if count:
+                self._log(f"Модель {folder} обновлена ({count} файл(ов)).")
+            else:
+                self._log(f"Модель {folder} уже актуальна.")
+            self._refresh_models_panel()
+            self._update_download_controls()
+            self._set_status("ready", "Готов", self._model_detail)
+            self._reload_model()
+        elif kind == "update_cancelled":
+            self._finish_operation()
+            self._log("Обновление отменено.")
+        elif kind == "update_error":
+            self._finish_operation()
+            self._set_status("error", "Ошибка обновления")
+            self._log(f"Не удалось обновить модель: {event[2]}")
+        elif kind == "app_update_checked":
+            self._on_app_update_checked(event[1])
+        elif kind == "app_update_progress":
+            pct = event[1]
+            if pct is not None:
+                self.app_update_bar.set(pct / 100)
+                self.app_update_status.configure(text=f"Скачиваю обновление… {pct}%")
+        elif kind == "app_update_ready":
+            self._on_app_update_ready(event[1])
+        elif kind == "app_update_error":
+            self._on_app_update_error(event[1])
         elif kind == "binding":
             self._apply_binding(event[1])
         elif kind == "tray_show":
@@ -1074,13 +1578,13 @@ class VoiceTexterApp(ctk.CTk):
                 "idle", "Нет моделей", "Скачайте модель — кнопка ниже или в трее"
             )
             return
-        model = self.model_combo.get()
+        model = self._model_name
         path = config.MODELS_DIR / model
         if not path.is_dir():
             self._log(f"Папка модели не найдена: {path}")
             return
         self._loading = True
-        device = self.device_combo.get()
+        device = self._device_mode()
         compute = self.compute_combo.get()
         self._set_status("busy", "Загрузка модели…", model)
         self._log(f"Загрузка {model} ({device}/{compute})…")
@@ -1105,43 +1609,34 @@ class VoiceTexterApp(ctk.CTk):
             entries.append((size, f"{size} — {modelstore.approx_size(size)}"))
         return entries
 
-    def _download_labels(self) -> list[str]:
-        labels = [label for _size, label in self._download_entries()]
-        return labels or ["все модели скачаны"]
-
     def _proxy_url(self) -> str:
         try:
             return self.proxy_entry.get().strip()
         except Exception:  # noqa: BLE001
             return ""
 
-    def _on_download_button(self) -> None:
-        if self._downloading:
-            self._download_cancel.set()
-            self._log("Отмена загрузки…")
-            return
-        self._start_download()
+    def _download_proxy(self) -> str:
+        """Прокси для загрузки/обновления — если включена галочка «через прокси»."""
+        if not self.proxy_var.get():
+            return ""
+        return self._proxy_url()
 
     def _start_download(self, size: str | None = None) -> None:
-        """Запустить загрузку модели (``size`` — если пришло из трея/диалога)."""
+        """Запустить загрузку новой модели (size из трея/первичной настройки)."""
         if self._downloading:
             self._log("Загрузка уже идёт — дождитесь окончания.")
-            self._dlg_status("Загрузка уже идёт…")
             return
-        if size is None:
-            label = self.download_combo.get()
-            size = label.split("—", 1)[0].strip()
-        if size not in modelstore.KNOWN_MODELS:
-            self._log("Выберите модель для загрузки.")
-            self._dlg_status("Выберите модель из списка.")
+        if size is None or size not in modelstore.KNOWN_MODELS:
+            self._log("Выберите модель в разделе «Модели».")
             return
         if modelstore.is_installed(size, config.MODELS_DIR):
             self._log(f"Модель {size} уже скачана.")
-            self._dlg_status("Эта модель уже скачана.")
             return
 
-        proxy = self._proxy_url() if self.proxy_var.get() else ""
+        proxy = self._download_proxy()
         self._downloading = True
+        self._dl_kind = "download"
+        self._active_folder = modelstore.folder_name(size)
         self._download_cancel.clear()
         self._update_download_controls()
         self._set_download_bar(0)
@@ -1150,76 +1645,150 @@ class VoiceTexterApp(ctk.CTk):
         )
         suffix = f" через прокси {proxy}" if proxy else ""
         self._log(f"Скачиваю {size} ({modelstore.approx_size(size)}){suffix}…")
-        self._dlg_status(f"Скачиваю {size}…")
         threading.Thread(
             target=self._download_worker, args=(size, proxy), daemon=True
         ).start()
 
-    # ------------------------------------------------- диалог скачивания
-
-    def _dlg_status(self, text: str) -> None:
-        if self._dlg is None:
+    def _start_update(self, size: str, folder: str) -> None:
+        """Обновить установленную модель — качаются только изменённые файлы."""
+        if self._downloading:
+            self._log("Другая операция уже идёт — дождитесь окончания.")
             return
-        try:
-            self._dlg["status"].configure(text=text)
-        except Exception:  # noqa: BLE001
-            pass
+        proxy = self._download_proxy()
+        self._downloading = True
+        self._dl_kind = "update"
+        self._active_folder = folder
+        self._model_notes.pop(folder, None)
+        self._download_cancel.clear()
+        self._update_download_controls()
+        self._set_download_bar(0)
+        self._set_status("busy", "Обновление модели…", folder)
+        self._log(f"Проверяю обновления {folder}…")
+        threading.Thread(
+            target=self._update_worker, args=(size, proxy), daemon=True
+        ).start()
 
-    def _open_download_dialog(self) -> None:
-        """Окно загрузки модели: при первом запуске и по кнопке в окне."""
-        if self._dlg is not None:
-            try:
-                if self._dlg["window"].winfo_exists():
-                    self._dlg["window"].deiconify()
-                    self._dlg["window"].lift()
-                    self._dlg["window"].focus_force()
-                    return
-            except Exception:  # noqa: BLE001
-                pass
-            self._dlg = None
+    def _check_updates(self, silent: bool = False) -> None:
+        """Проверить обновления для всех скачанных стандартных моделей.
 
-        win = ctk.CTkToplevel(self)
-        win.title("Скачать модель")
-        win.configure(fg_color=PALETTE["bg"])
-        win.resizable(False, False)
-        win.geometry("450x470")
-        win.transient(self)
-        try:
-            win.attributes("-topmost", True)
-            win.after(400, lambda: win.attributes("-topmost", False))
-        except Exception:  # noqa: BLE001
-            pass
-        win.protocol("WM_DELETE_WINDOW", self._close_download_dialog)
+        silent=True (автопроверка при старте) не трогает статус и не шумит
+        в журнале при ошибках.
+        """
+        if self._downloading:
+            if not silent:
+                self._log("Дождитесь окончания текущей операции.")
+            return
+        installed = [
+            s
+            for s in modelstore.known_sizes()
+            if modelstore.is_installed(s, config.MODELS_DIR)
+        ]
+        if not installed:
+            if not silent:
+                self._log("Нет скачанных моделей — сначала скачайте модель.")
+            return
+        proxy = self._download_proxy()
+        self._downloading = True
+        self._dl_kind = "check"
+        self._active_folder = None
+        self._model_notes.clear()
+        self._update_download_controls()
+        if not silent:
+            self._set_status("busy", "Проверка обновлений…")
+            self._log("Проверяю обновления моделей…")
+        threading.Thread(
+            target=self._check_worker,
+            args=(installed, proxy, silent),
+            daemon=True,
+        ).start()
 
-        body = ctk.CTkFrame(win, fg_color=PALETTE["panel"], corner_radius=16)
-        body.pack(fill="both", expand=True, padx=14, pady=14)
-        body.grid_columnconfigure(0, weight=1)
+    def _progress_reporter(self, size: str):
+        last = {"percent": -1}
 
+        def on_progress(p: dict) -> None:
+            if p.get("percent") != last["percent"]:
+                last["percent"] = p.get("percent")
+                self._post(("download_progress", size, p))
+
+        return on_progress
+
+    # ----------------------------------- первичная настройка (в главном окне)
+
+    def _show_setup(self) -> None:
+        """Первичная настройка прямо в главном окне (без отдельного окна)."""
+        if self._setup is not None:
+            return
+
+        overlay = ctk.CTkFrame(self, fg_color=PALETTE["bg"], corner_radius=0)
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        overlay.grid_columnconfigure(0, weight=1)
+        overlay.grid_rowconfigure(0, weight=1)
+
+        card = ctk.CTkFrame(overlay, fg_color=PALETTE["panel"], corner_radius=18)
+        card.grid(row=0, column=0, padx=14, pady=14, sticky="nsew")
+        card.grid_columnconfigure(0, weight=1)
+
+        first_run = not config.list_models()
+        title = "Добро пожаловать!" if first_run else "Модель и настройки"
+        subtitle = (
+            "Выберите язык, модель и устройство. Модель скачается сразу, "
+            "и приложение будет готово к работе."
+            if first_run
+            else "Выберите модель для загрузки и параметры распознавания."
+        )
         ctk.CTkLabel(
-            body,
-            text="Скачивание модели",
+            card,
+            text=title,
             font=self.f_title,
             text_color=PALETTE["text"],
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 2))
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 2))
         ctk.CTkLabel(
-            body,
-            text=(
-                "Модель распознавания хранится локально и качается один раз. "
-                "Для первого запуска удобна small (~480 МБ); "
-                "large-v3-turbo точнее, но больше (~1.6 ГБ)."
-            ),
+            card,
+            text=subtitle,
             font=self.f_small,
             text_color=PALETTE["muted"],
-            wraplength=390,
+            wraplength=380,
             justify="left",
         ).grid(row=1, column=0, sticky="w", padx=16)
 
         ctk.CTkLabel(
-            body, text="Модель", font=self.f_label, text_color=PALETTE["muted"]
-        ).grid(row=2, column=0, sticky="w", padx=16, pady=(12, 2))
-        combo = ctk.CTkComboBox(
-            body,
-            values=self._download_labels(),
+            card,
+            text="Язык распознавания",
+            font=self.f_label,
+            text_color=PALETTE["muted"],
+        ).grid(row=2, column=0, sticky="w", padx=16, pady=(16, 2))
+        lang_var = ctk.StringVar(value=self.lang_combo.get() or "ru")
+        ctk.CTkSegmentedButton(
+            card,
+            values=["ru", "en", "auto"],
+            variable=lang_var,
+            font=self.f_body,
+            fg_color=PALETTE["panel_2"],
+            selected_color=PALETTE["accent"],
+            selected_hover_color=PALETTE["accent_hover"],
+            unselected_color=PALETTE["panel_2"],
+            unselected_hover_color=PALETTE["border"],
+            text_color=PALETTE["text"],
+            corner_radius=9,
+            height=34,
+        ).grid(row=3, column=0, sticky="ew", padx=16)
+
+        ctk.CTkLabel(
+            card,
+            text="Модель распознавания",
+            font=self.f_label,
+            text_color=PALETTE["muted"],
+        ).grid(row=4, column=0, sticky="w", padx=16, pady=(14, 2))
+        sizes = list(modelstore.known_sizes())
+        if not sizes:
+            sizes = ["small"]
+        labels = [f"{s} — {modelstore.approx_size(s)}" for s in sizes]
+        default_size = "large-v3-turbo" if cuda_available() else "small"
+        if default_size not in sizes:
+            default_size = sizes[0]
+        model_combo = ctk.CTkComboBox(
+            card,
+            values=labels,
             fg_color=PALETTE["panel_2"],
             border_color=PALETTE["border"],
             border_width=1,
@@ -1233,12 +1802,38 @@ class VoiceTexterApp(ctk.CTk):
             height=34,
             font=self.f_body,
         )
-        combo.grid(row=3, column=0, sticky="ew", padx=16)
+        model_combo.set(f"{default_size} — {modelstore.approx_size(default_size)}")
+        model_combo.grid(row=5, column=0, sticky="ew", padx=16)
 
+        ctk.CTkLabel(
+            card,
+            text="Устройство (CPU / GPU)",
+            font=self.f_label,
+            text_color=PALETTE["muted"],
+        ).grid(row=6, column=0, sticky="w", padx=16, pady=(14, 2))
+        device_var = ctk.StringVar(value=DEVICE_LABELS[self._device_mode()])
+        ctk.CTkSegmentedButton(
+            card,
+            values=list(DEVICE_LABELS.values()),
+            variable=device_var,
+            font=self.f_body,
+            fg_color=PALETTE["panel_2"],
+            selected_color=PALETTE["accent"],
+            selected_hover_color=PALETTE["accent_hover"],
+            unselected_color=PALETTE["panel_2"],
+            unselected_hover_color=PALETTE["border"],
+            text_color=PALETTE["text"],
+            corner_radius=9,
+            height=34,
+        ).grid(row=7, column=0, sticky="ew", padx=16)
+
+        proxy_row = ctk.CTkFrame(card, fg_color="transparent")
+        proxy_row.grid(row=8, column=0, sticky="ew", padx=16, pady=(14, 0))
+        proxy_row.grid_columnconfigure(0, weight=1)
         proxy_var = ctk.BooleanVar(value=bool(self.proxy_var.get()))
         ctk.CTkCheckBox(
-            body,
-            text="Использовать прокси (для Hugging Face)",
+            proxy_row,
+            text="Скачивать через прокси",
             variable=proxy_var,
             font=self.f_body,
             text_color=PALETTE["text"],
@@ -1247,108 +1842,93 @@ class VoiceTexterApp(ctk.CTk):
             border_color=PALETTE["border"],
             checkmark_color="#0d0f14",
             corner_radius=5,
-        ).grid(row=4, column=0, sticky="w", padx=16, pady=(10, 2))
+        ).grid(row=0, column=0, sticky="w")
         proxy_entry = ctk.CTkEntry(
-            body,
-            placeholder_text="http://host:port или socks5://user:pass@host:port",
+            proxy_row,
+            placeholder_text="socks5://host:port или http://host:port",
             fg_color=PALETTE["panel_2"],
             border_color=PALETTE["border"],
             border_width=1,
             text_color=PALETTE["text"],
             placeholder_text_color=PALETTE["faint"],
             corner_radius=9,
-            height=34,
-            font=self.f_body,
+            height=32,
+            font=self.f_small,
         )
-        proxy_entry.grid(row=5, column=0, sticky="ew", padx=16)
+        proxy_entry.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         proxy_entry.insert(0, self._proxy_url())
 
-        bar = ctk.CTkProgressBar(
-            body,
-            height=10,
-            corner_radius=5,
-            fg_color=PALETTE["panel_2"],
-            progress_color=PALETTE["accent"],
-        )
-        bar.set(0)
-        bar.grid(row=6, column=0, sticky="ew", padx=16, pady=(14, 4))
-
-        status = ctk.CTkLabel(
-            body,
-            text="Выберите модель и нажмите «Скачать».",
-            font=self.f_small,
-            text_color=PALETTE["muted"],
-            wraplength=390,
-            justify="left",
-        )
-        status.grid(row=7, column=0, sticky="w", padx=16)
-
-        btn = ctk.CTkButton(
-            body,
-            text="⬇   Скачать",
-            font=self.f_body,
-            height=42,
-            corner_radius=12,
-            fg_color=PALETTE["accent"],
-            hover_color=PALETTE["accent_hover"],
-            text_color="#0d0f14",
-            command=self._dialog_download_click,
-        )
-        btn.grid(row=8, column=0, sticky="ew", padx=16, pady=(14, 4))
-
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.grid(row=9, column=0, sticky="ew", padx=16, pady=(18, 16))
+        btns.grid_columnconfigure(0, weight=1)
         ctk.CTkButton(
-            body,
-            text="Закрыть",
+            btns,
+            text="Пропустить",
             font=self.f_body,
-            height=34,
+            height=40,
+            corner_radius=11,
             fg_color="transparent",
             hover_color=PALETTE["panel_2"],
             border_color=PALETTE["border"],
             border_width=1,
             text_color=PALETTE["muted"],
-            corner_radius=9,
-            command=self._close_download_dialog,
-        ).grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 14))
+            command=self._hide_setup,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            btns,
+            text="Начать",
+            font=self.f_body,
+            height=40,
+            corner_radius=11,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"],
+            text_color="#0d0f14",
+            command=self._setup_confirm,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-        self._dlg = {
-            "window": win,
-            "combo": combo,
+        self._setup = {
+            "overlay": overlay,
+            "lang": lang_var,
+            "model": model_combo,
+            "device": device_var,
             "proxy_var": proxy_var,
             "proxy_entry": proxy_entry,
-            "bar": bar,
-            "status": status,
-            "btn": btn,
         }
-        if self._downloading:
-            self._dlg_status("Загрузка идёт…")
-        self._update_download_controls()
 
-    def _dialog_download_click(self) -> None:
-        if self._downloading:
-            self._download_cancel.set()
-            self._dlg_status("Отмена загрузки…")
+    def _setup_confirm(self) -> None:
+        if self._setup is None:
             return
-        if self._dlg is None:
+        s = self._setup
+        lang = s["lang"].get()
+        device = DEVICE_VALUES.get(s["device"].get(), "auto")
+        size = s["model"].get().split("—", 1)[0].strip()
+
+        self.lang_combo.set(lang)
+        self._set_device_mode(device)
+        self.proxy_var.set(bool(s["proxy_var"].get()))
+        self.proxy_entry.delete(0, "end")
+        self.proxy_entry.insert(0, s["proxy_entry"].get().strip())
+        self._sync_cached_settings()
+        config.save_config(self.cfg)
+
+        self._hide_setup()
+        self._log(f"Настройка: язык {lang}, устройство {device}, модель {size}.")
+        if size in modelstore.KNOWN_MODELS and not modelstore.is_installed(
+            size, config.MODELS_DIR
+        ):
+            self._start_download(size)
+        else:
+            self._reload_model()
+
+    def _hide_setup(self) -> None:
+        if self._setup is None:
             return
         try:
-            self.proxy_var.set(bool(self._dlg["proxy_var"].get()))
-            self.proxy_entry.delete(0, "end")
-            self.proxy_entry.insert(0, self._dlg["proxy_entry"].get().strip())
-            self._sync_cached_settings()
+            self._setup["overlay"].place_forget()
+            self._setup["overlay"].destroy()
         except Exception:  # noqa: BLE001
             pass
-        label = self._dlg["combo"].get()
-        size = label.split("—", 1)[0].strip()
-        self._start_download(size)
-
-    def _close_download_dialog(self) -> None:
-        if self._dlg is None:
-            return
-        try:
-            self._dlg["window"].destroy()
-        except Exception:  # noqa: BLE001
-            pass
-        self._dlg = None
+        self._setup = None
 
     # --------------------------------------------- прогресс загрузки
 
@@ -1366,39 +1946,41 @@ class VoiceTexterApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
 
+    def _clear_download_status(self) -> None:
+        try:
+            self.download_status.configure(text="")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _show_download_progress(self, size: str, p: dict) -> None:
+        title = (
+            "Обновление модели…" if self._dl_kind == "update" else "Загрузка модели…"
+        )
         pct = p.get("percent")
         if pct is None:
             text = f"{size}: {p.get('file_done', 0) // 1048576} МБ"
         else:
             text = f"{size}: {pct}%  ·  {p.get('file', '')}"
-        self._set_status("busy", "Загрузка модели…", text)
+        self._set_status("busy", title, text)
         self._set_download_bar(pct)
         try:
             self.download_status.configure(text=text)
         except Exception:  # noqa: BLE001
             pass
-        if self._dlg is not None:
+        row = self.models_rows.get(modelstore.folder_name(size))
+        if row is not None and pct is not None:
             try:
-                self._dlg["status"].configure(text=text)
-                self._dlg["bar"].set(0 if pct is None else pct / 100)
+                row["status"].configure(text=f"{pct}%", text_color=PALETTE["busy"])
             except Exception:  # noqa: BLE001
                 pass
 
     def _download_worker(self, size: str, proxy: str) -> None:
-        last = {"percent": -1}
-
-        def on_progress(p: dict) -> None:
-            if p.get("percent") != last["percent"]:
-                last["percent"] = p.get("percent")
-                self._post(("download_progress", size, p))
-
         try:
             modelstore.download(
                 size,
                 config.MODELS_DIR,
                 proxy_url=proxy,
-                on_progress=on_progress,
+                on_progress=self._progress_reporter(size),
                 should_stop=self._download_cancel.is_set,
             )
             self._post(("download_done", size))
@@ -1407,49 +1989,64 @@ class VoiceTexterApp(ctk.CTk):
         except Exception as exc:  # noqa: BLE001
             self._post(("download_error", size, f"{type(exc).__name__}: {exc}"))
 
-    def _update_download_controls(self) -> None:
+    def _update_worker(self, size: str, proxy: str) -> None:
         try:
-            self.download_combo.configure(values=self._download_labels())
-            if self._downloading:
-                self.download_btn.configure(
-                    text="✕",
-                    fg_color=PALETTE["panel_2"],
-                    hover_color=PALETTE["border"],
-                    text_color=PALETTE["text"],
-                )
-            else:
-                self.download_btn.configure(
-                    text="⬇",
-                    fg_color=PALETTE["accent"],
-                    hover_color=PALETTE["accent_hover"],
-                    text_color="#0d0f14",
-                )
-        except Exception:  # noqa: BLE001
-            pass
-        if self._dlg is not None:
-            try:
-                self._dlg["combo"].configure(values=self._download_labels())
-                self._dlg["btn"].configure(
-                    text="✕   Отмена" if self._downloading else "⬇   Скачать"
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            changed = modelstore.update(
+                size,
+                config.MODELS_DIR,
+                proxy_url=proxy,
+                on_progress=self._progress_reporter(size),
+                should_stop=self._download_cancel.is_set,
+            )
+            self._post(("update_done", size, len(changed)))
+        except modelstore.DownloadCancelled:
+            self._post(("update_cancelled", size))
+        except Exception as exc:  # noqa: BLE001
+            self._post(("update_error", size, f"{type(exc).__name__}: {exc}"))
 
-    def _refresh_model_options(self, select: str | None = None) -> None:
-        values = self._model_values()
-        try:
-            self.model_combo.configure(values=values)
-            if select:
-                self.model_combo.set(select)
-            elif self.model_combo.get() not in values:
-                self.model_combo.set(self._pick(values, None))
-        except Exception:  # noqa: BLE001
-            pass
+    def _check_worker(self, sizes: list[str], proxy: str, silent: bool = False) -> None:
+        for size in sizes:
+            if self._download_cancel.is_set():
+                break
+            folder = modelstore.folder_name(size)
+            try:
+                changed = modelstore.check_update(
+                    size, config.MODELS_DIR, proxy_url=proxy
+                )
+                note = "update" if changed else "actual"
+            except Exception as exc:  # noqa: BLE001
+                if silent:
+                    # Автопроверка при старте не должна шуметь, если сети нет.
+                    continue
+                note = "error"
+                self._post(("log", f"Не удалось проверить {folder}: {exc}"))
+            self._post(("update_status", folder, note))
+        self._post(("check_done", silent))
+
+    def _finish_operation(self, silent: bool = False) -> None:
+        """Сбросить состояние загрузки/обновления/проверки и обновить панель."""
+        self._downloading = False
+        self._dl_kind = ""
+        self._active_folder = None
+        self._download_cancel.clear()
+        self._hide_download_bars()
+        self._clear_download_status()
+        self._refresh_models_panel()
+        self._update_download_controls()
+        if not silent:
+            self._set_status("ready", "Готов", self._model_detail)
+
+    def _update_download_controls(self) -> None:
+        for folder in list(self.models_rows):
+            self._update_model_row(folder)
 
     def _after_download(self, size: str) -> None:
         name = modelstore.folder_name(size)
         self._log(f"Модель {size} скачана в models/{name}.")
-        self._refresh_model_options(select=name)
+        self._model_name = name
+        self._model_notes[name] = "actual"
+        self._sync_cached_settings()
+        self._refresh_models_panel()
         if self._tray is not None:
             self._tray.update_models(self._model_values())
             self._tray.update_downloads(self._download_entries())

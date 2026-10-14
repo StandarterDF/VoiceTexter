@@ -38,6 +38,8 @@ datas = [
     (_path("assets", "icon.ico"), "assets"),
     (_path("assets", "icon.png"), "assets"),
     (_path("config.json.example"), "."),
+    # Версия приложения для проверки обновлений (updater.app_version).
+    (_path("packaging", "version_info.txt"), "packaging"),
 ]
 
 binaries = []
