@@ -66,6 +66,12 @@ VoiceTexter.spec, build_exe.bat, requirements-build.txt — PyInstaller build
   The download runs in a worker thread; progress/done/error are `_post`ed as
   `download_progress` / `download_done` / `download_cancelled` / `download_error`.
   On success the app refreshes the model combo + tray and reloads the model.
+  UI: the download control lives in Settings, but the primary entry points are the
+  **first-run dialog** (`_open_download_dialog`, auto-opened when `models/` is empty)
+  and the card button «⬇ Скачать модель»; progress is shown by a `CTkProgressBar`
+  in both the dialog and the settings row. With no models the status is «Нет
+  моделей», not a stuck «Загрузка модели…». The dialog's proxy fields are synced
+  into the main `proxy_var`/`proxy_entry` on download.
 - **Device/compute resolution**: `auto` → `cuda` iff `transcriber.cuda_available()`
   (loads `nvcuda.dll` / `libcuda.so`), else `cpu`; compute `auto` → `float16` on
   CUDA, `int8` on CPU. Reloading with a new device/compute swaps the model.
